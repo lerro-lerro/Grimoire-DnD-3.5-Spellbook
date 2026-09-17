@@ -1,0 +1,26 @@
+# Your books, characters and downloaded spells: they stay on your computer
+data/
+
+# Rules text downloaded on first start (SRD conditions, dndtools metamagic feats)
+web/conditions.json
+web/metamagic.json
+
+# Personal notes and assistant instructions
+CLAUDE.md
+.claude/
+personal/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.tmp
+
+# Editors and operating systems
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

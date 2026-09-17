@@ -1,0 +1,301 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>my-grimoire</title>
+  <meta name="theme-color" content="#15100c">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="my-grimoire">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@500;700&family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#/">
+      <span class="seal" aria-hidden="true">✦</span>
+      <span class="brand-name">Grimoire</span>
+    </a>
+    <nav class="breadcrumbs" id="breadcrumbs"></nav>
+    <div class="bar-actions">
+      <button class="button ghost" id="open-connect" type="button" title="Open the grimoire on a phone on the same Wi-Fi">
+        <svg class="bar-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="2.5" width="11" height="19" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10.5 18.5h3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span class="wide-only-bar">Connect device</span>
+      </button>
+      <button class="button ghost open-conditions" id="open-conditions" type="button" title="Condition summary (SRD)">
+        <span aria-hidden="true">☍</span><span class="wide-only-bar"> Conditions</span>
+      </button>
+    </div>
+  </header>
+
+  <main id="app" class="app" aria-live="polite"></main>
+
+  <!-- New book / book settings -->
+  <dialog id="book-dialog" class="dialog">
+    <form method="dialog" id="book-form" class="form">
+      <h2 id="book-dialog-title">New book</h2>
+      <label>Book name
+        <input name="name" required maxlength="120" autocomplete="off">
+      </label>
+      <div class="field-row">
+        <label>Character
+          <select name="character" required></select>
+        </label>
+        <label>Class
+          <select name="class_type">
+            <option value="wizard">Wizard</option>
+            <option value="sorcerer">Sorcerer</option>
+            <option value="cleric">Cleric</option>
+            <option value="druid">Druid</option>
+            <optgroup label="Other classes">
+              <option value="arcane-prepared">Arcane, prepares spells (like a wizard)</option>
+              <option value="arcane-spontaneous">Arcane, casts spontaneously (like a sorcerer or bard)</option>
+              <option value="divine-prepared">Divine, prepares spells (like a cleric, paladin or ranger)</option>
+              <option value="divine-spontaneous">Divine, casts spontaneously (like a favored soul)</option>
+            </optgroup>
+          </select>
+        </label>
+      </div>
+      <label id="class-name-field" hidden>Class name
+        <input name="caster_class" maxlength="60" list="classes" placeholder="Bard" autocomplete="off">
+        <datalist id="classes">
+          <option value="Adept"><option value="Archivist"><option value="Bard"><option value="Beguiler">
+          <option value="Dread Necromancer"><option value="Duskblade"><option value="Favored Soul"><option value="Healer">
+          <option value="Hexblade"><option value="Paladin"><option value="Ranger"><option value="Spirit Shaman">
+          <option value="Warmage"><option value="Wu Jen">
+        </datalist>
+        <small>Used for the spell levels on dndtools.</small>
+      </label>
+      <p class="help class-note" id="class-note"></p>
+      <div class="field-row">
+        <label>Pages in the book
+          <input name="max_pages" type="number" min="1" max="10000" value="100">
+          <small>100 for a standard spellbook, 1000 for a Blessed Book of Boccob</small>
+        </label>
+        <fieldset class="colors">
+          <legend>Cover</legend>
+          <div class="swatches" id="swatches"></div>
+        </fieldset>
+      </div>
+      <label>Notes
+        <textarea name="notes" rows="3" maxlength="2000" placeholder="Protections on the book, where it is kept…"></textarea>
+      </label>
+      <fieldset class="availability" id="availability-field" hidden>
+        <legend>Availability</legend>
+        <div class="field-row">
+          <label>Is the book with you?
+            <select name="availability">
+              <option value="">Yes, available</option>
+              <option value="lost">No, lost</option>
+              <option value="stolen">No, stolen</option>
+              <option value="other">No, not available for another reason</option>
+            </select>
+          </label>
+          <label id="unavailable-note-field" hidden>What happened?
+            <input name="unavailable_note" maxlength="300" autocomplete="off" placeholder="Stolen by the thieves' guild in Waterdeep">
+          </label>
+        </div>
+        <small>A book that is not available keeps all its spells, prepared copies and scrolls, but its spells can't be prepared and the book can't be changed. Mark it as available again to get everything back.</small>
+        <p class="help" id="locked-note" hidden>While the book is not available only this part can change: the other fields are locked.</p>
+      </fieldset>
+      <details class="removed-spells" id="removed-spells" hidden>
+        <summary>Removed spells (<span id="removed-count">0</span>)</summary>
+        <p class="help">Hidden from this book. “Restore” brings one back with its level, prepared copies, scrolls and favorite mark; “Delete” removes it for good.</p>
+        <ul class="removed-list" id="removed-list"></ul>
+        <p class="help" id="removed-status" role="status"></p>
+      </details>
+      <p class="form-error" id="book-error" hidden></p>
+      <div class="form-actions">
+        <button type="button" class="button danger" id="delete-book" hidden>Delete book</button>
+        <span class="spacer"></span>
+        <button type="button" class="button ghost" data-close>Cancel</button>
+        <button type="submit" class="button gold" id="save-book">Create book</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- New character / rename -->
+  <dialog id="character-dialog" class="dialog narrow">
+    <form id="character-form" class="form">
+      <h2 id="character-dialog-title">New character</h2>
+      <p class="help">Each character has their own spellbooks, spells per day, metamagic feats and prepared spells.</p>
+      <label>Name
+        <input name="name" required maxlength="80" autocomplete="off">
+      </label>
+      <p class="form-error" id="character-error" hidden></p>
+      <div class="form-actions">
+        <button type="button" class="button danger" id="delete-character" hidden>Delete</button>
+        <span class="spacer"></span>
+        <button type="button" class="button ghost" data-close>Cancel</button>
+        <button type="submit" class="button gold" id="save-character">Create character</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Add a spell -->
+  <dialog id="add-dialog" class="dialog wide">
+    <form id="add-form" class="form">
+      <h2>Add a spell</h2>
+      <p class="help">Paste the link to the spell's page on <a href="https://dndtools.net/spells/" target="_blank" rel="noopener">dndtools.net</a>.
+        Several links pasted together are added in one go.
+        <button type="button" class="link" id="open-finder-from-add">Search dndtools</button> to pick spells with its filters.
+        Not there? <button type="button" class="link" id="open-handwritten">Write the spell by hand</button></p>
+      <div class="link-field">
+        <input name="url" type="url" required autocomplete="off" spellcheck="false"
+               placeholder="https://dndtools.net/spells/players-handbook-v35--6/grease--2396/">
+        <div class="link-buttons">
+          <button type="button" class="button" id="paste-link" hidden>Paste</button>
+          <button type="submit" class="button" id="load-preview">Look up</button>
+        </div>
+      </div>
+      <p class="form-error" id="add-error" hidden></p>
+      <div id="preview" class="preview" hidden></div>
+      <div class="form-actions">
+        <span class="spacer"></span>
+        <button type="button" class="button ghost" data-close>Close</button>
+        <button type="button" class="button gold" id="confirm-add" disabled>Add to book</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Hand-written spell -->
+  <dialog id="handwritten-dialog" class="dialog wide">
+    <form id="handwritten-form" class="form" novalidate>
+      <h2 id="handwritten-title">Write a spell by hand</h2>
+      <p class="help" id="handwritten-help">For homebrew spells or spells that are not on dndtools. Only the name is required.</p>
+      <div class="field-row">
+        <label>Spell name
+          <input name="name" required maxlength="120" autocomplete="off">
+        </label>
+        <label id="handwritten-level-field">Level in this book
+          <select name="level">
+            <option value="">From the spell levels</option>
+            <option value="0">0 — cantrip</option>
+            <option value="1">Level 1</option><option value="2">Level 2</option><option value="3">Level 3</option>
+            <option value="4">Level 4</option><option value="5">Level 5</option><option value="6">Level 6</option>
+            <option value="7">Level 7</option><option value="8">Level 8</option><option value="9">Level 9</option>
+          </select>
+        </label>
+      </div>
+      <div class="field-row three">
+        <label>School
+          <select name="school">
+            <option value="">—</option>
+            <option>Abjuration</option><option>Conjuration</option><option>Divination</option>
+            <option>Enchantment</option><option>Evocation</option><option>Illusion</option>
+            <option>Necromancy</option><option>Transmutation</option><option>Universal</option>
+          </select>
+        </label>
+        <label>Subschool
+          <input name="subschools" maxlength="80" autocomplete="off" placeholder="Creation">
+        </label>
+        <label>Descriptors
+          <input name="descriptors" maxlength="120" autocomplete="off" placeholder="Fire, Mind-Affecting">
+        </label>
+      </div>
+      <label>Spell levels
+        <input name="levels" maxlength="400" autocomplete="off" placeholder="Sorcerer/Wizard 3, Cleric 4, Fire domain 3">
+        <small>Class and level, separated by commas. Used to pick the level in this book.</small>
+      </label>
+      <fieldset class="component-choices">
+        <legend>Components</legend>
+        <div>
+          <label><input type="checkbox" name="components" value="V"> V</label>
+          <label><input type="checkbox" name="components" value="S"> S</label>
+          <label><input type="checkbox" name="components" value="M"> M</label>
+          <label><input type="checkbox" name="components" value="F"> F</label>
+          <label><input type="checkbox" name="components" value="AF"> AF</label>
+          <label><input type="checkbox" name="components" value="DF"> DF</label>
+          <label><input type="checkbox" name="components" value="XP"> XP</label>
+        </div>
+      </fieldset>
+      <div class="field-row">
+        <label>Casting time <input name="casting_time" maxlength="200" autocomplete="off" placeholder="1 standard action"></label>
+        <label>Range <input name="range" maxlength="200" autocomplete="off" placeholder="Close (25 ft. + 5 ft./2 levels)"></label>
+      </div>
+      <div class="field-row three">
+        <label>Target <input name="target" maxlength="200" autocomplete="off" placeholder="One creature"></label>
+        <label>Area <input name="area" maxlength="200" autocomplete="off"></label>
+        <label>Effect <input name="effect" maxlength="200" autocomplete="off"></label>
+      </div>
+      <div class="field-row three">
+        <label>Duration <input name="duration" maxlength="200" autocomplete="off" placeholder="1 round/level"></label>
+        <label>Saving throw <input name="saving_throw" maxlength="200" autocomplete="off" placeholder="Will negates"></label>
+        <label>Spell resistance <input name="spell_resistance" maxlength="200" autocomplete="off" placeholder="Yes"></label>
+      </div>
+      <div class="field-row source-fields">
+        <label>Source <input name="rulebook" maxlength="120" autocomplete="off" placeholder="Homebrew, or the rulebook"></label>
+        <label>Page <input name="page" type="number" inputmode="numeric" min="1" max="9999"></label>
+      </div>
+      <label>Description
+        <textarea name="description" rows="10" maxlength="30000" placeholder="A shimmering red barrier surrounds the subject…"></textarea>
+        <small>Press Enter after a sentence to start a new paragraph. Lines like “Material Component: …” are shown as separate notes, and conditions such as stunned or blinded become links.</small>
+      </label>
+      <p class="form-error" id="handwritten-error" hidden></p>
+      <div class="form-actions">
+        <span class="spacer"></span>
+        <button type="button" class="button ghost" data-close>Cancel</button>
+        <button type="submit" class="button gold" id="save-handwritten">Add to book</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Search dndtools -->
+  <dialog id="finder-dialog" class="dialog finder-dialog" aria-label="Search dndtools">
+    <div id="finder" class="form"></div>
+  </dialog>
+
+  <!-- Add scrolls: what they cost to buy or scribe, against the gold to spend -->
+  <dialog id="cart-dialog" class="dialog cart-dialog" aria-label="Add scrolls">
+    <div id="cart" class="form"></div>
+  </dialog>
+
+  <!-- Full spell sheet -->
+  <dialog id="sheet-dialog" class="dialog sheet-dialog">
+    <div id="sheet"></div>
+  </dialog>
+
+  <!-- Connect a device (QR code with the address on the home network) -->
+  <dialog id="connect-dialog" class="dialog narrow" aria-label="Connect a device">
+    <div id="connect" class="form"></div>
+  </dialog>
+
+  <!-- Metamagic -->
+  <dialog id="metamagic-dialog" class="dialog wide" aria-label="Metamagic">
+    <div id="metamagic" class="form"></div>
+  </dialog>
+
+  <!-- Conditions (SRD) -->
+  <dialog id="condition-dialog" class="dialog condition-dialog" aria-label="Condition">
+    <div id="condition"></div>
+  </dialog>
+
+  <!-- Confirmation -->
+  <dialog id="confirm-dialog" class="dialog narrow">
+    <form method="dialog" class="form">
+      <h2 id="confirm-title">Are you sure?</h2>
+      <p id="confirm-text"></p>
+      <label class="confirm-option" id="confirm-option-field" hidden>
+        <input type="checkbox" id="confirm-option"> <span id="confirm-option-text"></span>
+      </label>
+      <div class="form-actions">
+        <span class="spacer"></span>
+        <button value="no" class="button ghost">Cancel</button>
+        <button value="yes" class="button danger" id="confirm-yes">Confirm</button>
+      </div>
+    </form>
+  </dialog>
+
+  <button type="button" class="to-top" id="to-top" aria-label="Back to the top of the page" title="Back to the top" hidden></button>
+  <div id="toasts" class="toasts" role="status"></div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

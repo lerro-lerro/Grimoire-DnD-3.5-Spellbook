@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <radialGradient id="leather" cx="35%" cy="25%" r="85%">
+      <stop offset="0" stop-color="#8a2a24"/>
+      <stop offset="1" stop-color="#4a1210"/>
+    </radialGradient>
+    <linearGradient id="gold" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f1d98f"/>
+      <stop offset="1" stop-color="#b8893a"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" fill="#15100c"/>
+  <!-- book cover -->
+  <rect x="112" y="84" width="300" height="344" rx="22" fill="url(#leather)"/>
+  <rect x="112" y="84" width="46" height="344" rx="14" fill="#2c0b09" opacity=".75"/>
+  <rect x="178" y="110" width="210" height="292" rx="12" fill="none" stroke="url(#gold)" stroke-width="7"/>
+  <!-- four-pointed star -->
+  <path d="M283 170 L303 236 L369 256 L303 276 L283 342 L263 276 L197 256 L263 236 Z" fill="url(#gold)"/>
+  <circle cx="283" cy="256" r="104" fill="none" stroke="url(#gold)" stroke-width="5" opacity=".7"/>
+</svg>
