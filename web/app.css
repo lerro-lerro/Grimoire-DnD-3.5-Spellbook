@@ -452,6 +452,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
   grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
   gap: 1rem;
 }
+/* thousands of spells: cards and rows off screen are laid out only when they come close */
+.spell-grid > .card { content-visibility: auto; contain-intrinsic-size: auto 280px; }
+.prep-list > .prep-row { content-visibility: auto; contain-intrinsic-size: auto 64px; }
 
 .card {
   --c: var(--universal);
@@ -1812,6 +1815,206 @@ button.row-star[aria-pressed="true"] { color: #fff8e6; background: var(--gold-da
 .import-summary p:last-child { margin-bottom: 0; }
 .import-failed { margin: .35rem 0 0; padding-left: 1.2rem; font-size: .9rem; color: #e8a8a0; }
 .parchment .import-summary { color: var(--ink); }
+
+/* downloads panel: searches and imports running on the server, on every page and above the open dialog */
+:root { --dock-space: 0px; }
+.job-dock {
+  position: fixed;
+  left: max(1rem, env(safe-area-inset-left));
+  bottom: calc(1rem + env(safe-area-inset-bottom));
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: .45rem;
+  width: min(360px, calc(100vw - 2rem));
+  max-height: 45vh;
+  max-height: 45dvh;
+  padding: .55rem;
+  border: 1px solid rgba(232, 207, 138, .45);
+  border-radius: 12px;
+  background: var(--leather-light);
+  box-shadow: var(--shadow);
+  color: var(--parchment);
+  font-family: var(--body-font);
+  font-size: 1rem;
+  line-height: 1.35;
+  text-align: left;
+  animation: fade-in .2s ease-out;
+}
+.job-dock[hidden] { display: none; }
+.job-dock.moved { animation: none; }  /* no slide-in again when it moves into a dialog */
+.dock-head { display: flex; align-items: center; gap: .5rem; }
+.dock-clear {
+  padding: .2rem .5rem;
+  border: 0;
+  background: none;
+  color: var(--parchment-2);
+  font: inherit;
+  font-size: .85rem;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.dock-clear[hidden] { display: none; }
+.dock-toggle {
+  flex: 1;
+  padding: .2rem .4rem;
+  border: 0;
+  background: none;
+  color: var(--gold-light);
+  font-family: var(--title-font);
+  font-size: .72rem;
+  letter-spacing: .1em;
+  text-align: left;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.dock-toggle::after { content: " ▾"; }
+.job-dock.minimized { width: auto; max-width: min(360px, calc(100vw - 2rem)); padding: .35rem .5rem; }
+.job-dock.minimized .dock-toggle::after { content: " ▴"; }
+.job-dock.minimized .dock-list { display: none; }
+.dock-list { display: flex; flex-direction: column; gap: .45rem; overflow-y: auto; overscroll-behavior: contain; }
+.job-card { display: flex; flex-direction: column; gap: .3rem; padding: .5rem .65rem; border-radius: 8px; background: rgba(0, 0, 0, .22); }
+.job-card.done { box-shadow: inset 3px 0 0 #6fae5a; }
+.job-card.failed { box-shadow: inset 3px 0 0 #d08a3a; }
+.job-card p { margin: 0; }
+.job-card p[hidden], .job-card .page-bar[hidden], .job-card [hidden] { display: none; }
+.job-card-head { display: flex; align-items: center; gap: .5rem; }
+.job-card-head .button { flex: none; }
+.job-title { flex: 1; min-width: 0; overflow-wrap: anywhere; font-weight: 600; }
+.job-detail { font-size: .88rem; color: var(--parchment-2); overflow-wrap: anywhere; }
+.job-text { font-size: .92rem; }
+.job-card.failed .job-text { color: #f3c79a; }
+.job-card .button { color: var(--parchment); }
+.job-dismiss {
+  flex: none;
+  width: 2rem;
+  height: 2rem;
+  margin: -.3rem -.4rem -.3rem 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--parchment-2);
+  font-size: 1.3rem;
+  line-height: 1;
+  cursor: pointer;
+}
+@media (hover: hover) {
+  .job-dismiss:hover { background: rgba(232, 207, 138, .15); color: var(--gold-light); }
+  .dock-toggle:hover { color: #fff3cf; }
+}
+/* messages and the "top" button go above the panel; a dialog ends above it */
+dialog:has(> .job-dock:not([hidden])) { bottom: var(--dock-space); }
+.dialog:has(> .job-dock:not([hidden])) { max-height: calc(100dvh - 3rem - var(--dock-space)); }
+.sheet-dialog:has(> .job-dock:not([hidden])) .parchment,
+.condition-dialog:has(> .job-dock:not([hidden])) .parchment { max-height: calc(100dvh - 3rem - var(--dock-space)); }
+@media (max-width: 700px) {
+  .job-dock { left: .5rem; right: .5rem; bottom: calc(.5rem + env(safe-area-inset-bottom)); width: auto; }
+  .job-dock.minimized { right: auto; }
+  .dialog:has(> .job-dock:not([hidden])) { max-height: calc(100dvh - 1rem - var(--dock-space)); }
+  .sheet-dialog:has(> .job-dock:not([hidden])) { height: calc(100dvh - var(--dock-space)); max-height: calc(100dvh - var(--dock-space)); }
+  .sheet-dialog:has(> .job-dock:not([hidden])) .parchment { height: calc(100dvh - var(--dock-space)); max-height: calc(100dvh - var(--dock-space)); }
+}
+/* picking several spells in the Spellbook tab */
+:root { --select-space: 0px; }
+.select-toggle {
+  flex: none;
+  padding: .35rem .85rem;
+  border-radius: 999px;
+  border: 1px solid rgba(232, 207, 138, .3);
+  background: transparent;
+  font-family: var(--title-font);
+  font-size: .8rem;
+  color: var(--gold-light);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.select-toggle[aria-pressed="true"] { background: rgba(232, 207, 138, .18); border-color: var(--gold); }
+@media (hover: hover) { .select-toggle:hover { border-color: var(--gold); background: rgba(232, 207, 138, .12); } }
+.selecting > .level-section .card { padding-right: 3rem; user-select: none; -webkit-user-select: none; }
+.selecting > .level-section .card::after {
+  content: "";
+  position: absolute;
+  top: .85rem;
+  right: .85rem;
+  display: grid;
+  place-items: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  border-radius: 50%;
+  border: 2px solid rgba(107, 88, 66, .5);
+  background: rgba(255, 255, 255, .75);
+  font-size: .9rem;
+  line-height: 1;
+  color: #fffaf0;
+}
+.selecting > .level-section .card.selected::after { content: "✓"; background: var(--gold-dark); border-color: var(--gold-dark); }
+.selecting > .level-section .card.selected {
+  background: rgba(232, 207, 138, .38);
+  box-shadow: 0 0 0 2px var(--gold-dark);
+}
+.selecting > .level-section .card.unavailable.selected { opacity: .8; }
+.level-select {
+  order: 1;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: .4rem;
+  padding: .35rem .75rem;
+  border-radius: 999px;
+  border: 1px solid rgba(107, 88, 66, .4);
+  font-size: .9rem;
+  color: var(--ink);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.level-select input { width: 1.1rem; height: 1.1rem; margin: 0; accent-color: var(--gold-dark); }
+@media (hover: hover) { .level-select:hover { background: rgba(107, 88, 66, .1); } }
+.select-bar {
+  position: fixed;
+  left: 50%;
+  bottom: calc(1rem + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  z-index: 80;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .5rem 1rem;
+  width: min(760px, calc(100vw - 2rem));
+  padding: .6rem .8rem;
+  border-radius: 12px;
+  border: 1px solid rgba(232, 207, 138, .5);
+  background: var(--leather-light);
+  box-shadow: var(--shadow);
+  color: var(--parchment);
+  animation: fade-in .2s ease-out;
+}
+.select-bar[hidden] { display: none; }
+.select-info { margin: 0; min-width: 0; }
+.select-info span { color: var(--parchment-2); font-size: .9rem; }
+.select-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: .4rem; margin-left: auto; }
+.select-bar .button { color: var(--parchment); }
+.select-bar .button.gold { color: #241808; }
+.select-bar .button.danger { color: #f4c9c0; }
+/* room for the bar: the page, the panel, the messages and the top button move above it */
+.app { padding-bottom: calc(5rem + var(--select-space)); }
+body > .job-dock { bottom: calc(1rem + env(safe-area-inset-bottom) + var(--select-space)); }
+.toasts { bottom: calc(1.5rem + env(safe-area-inset-bottom) + max(var(--dock-space), var(--select-space))); }
+.to-top { bottom: calc(1.2rem + env(safe-area-inset-bottom) + var(--select-space)); }
+@media (max-width: 700px) {
+  .select-bar { left: .5rem; right: .5rem; bottom: calc(.5rem + env(safe-area-inset-bottom)); width: auto; transform: none; }
+  .select-info { width: 100%; }
+  .select-actions { width: 100%; margin-left: 0; }
+  .select-actions .button { flex: 1 1 auto; justify-content: center; }
+  body > .job-dock { bottom: calc(.5rem + env(safe-area-inset-bottom) + var(--select-space)); }
+  .to-top, body:has(.toast) .to-top { bottom: calc(1.2rem + env(safe-area-inset-bottom) + max(var(--dock-space), var(--select-space))); }
+  .wide-only-select { display: none; }
+}
+@media (pointer: coarse) {
+  .select-toggle, .level-select, .select-bar .button { min-height: 2.75rem; }
+  .dock-toggle, .dock-clear { min-height: 2.75rem; }
+  .job-dismiss { width: 2.75rem; height: 2.75rem; }
+  .job-card .button { min-height: 2.75rem; }
+}
 @media (hover: hover) {
   .finder-name a:hover { text-decoration: underline; color: var(--gold-light); }
 }

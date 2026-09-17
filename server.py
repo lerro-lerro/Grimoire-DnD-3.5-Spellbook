@@ -2,12 +2,16 @@
 """Grimoire: local server for D&D 3.5 spellbooks.
 
 Usage:  python3 server.py              (opens the browser at http://my-grimoire.localhost:8765)
+        python3 server.py --start      (the same, in the background without a window: what the start scripts do)
+        python3 server.py --stop       (stops the server started on the same data folder)
         python3 server.py --port 9000 --no-browser
         python3 server.py --data /other/folder   (use a different data folder)
         python3 server.py --network              (phones on the same Wi-Fi open http://my-grimoire.local:8765/)
 """
 
 import argparse
+import gzip
+import hashlib
 import html
 import json
 import mimetypes
@@ -23,6 +27,7 @@ import sys
 import threading
 import time
 import unicodedata
+import urllib.request
 import webbrowser
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
@@ -37,9 +42,9 @@ if sys.version_info < (3, 9):
     sys.exit("Grimoire needs Python 3.9 or newer.")
 try:
     from grimoire import conditions, dndtools, metamagic, search, units  # noqa: E402
-except ImportError as missing:
-    sys.exit(f"Missing Python module: {missing.name}. Install it with: python3 -m pip install -r requirements.txt "
-             "(or use the start script for your system).")
+    MISSING_MODULE = None
+except ImportError as missing:  # --stop works without lxml; everything else says what to install
+    MISSING_MODULE = missing.name
 
 APP_DIR = Path(__file__).resolve().parent
 WEB = APP_DIR / "web"
@@ -49,6 +54,7 @@ METAMAGIC_FILE = WEB / "metamagic.json"  # the dndtools metamagic feats, kept of
 METAMAGIC_LOCK = threading.Lock()
 METAMAGIC_JOB = {"thread": None, "error": None, "failed_at": 0.0}
 LOCAL_NAME = "my-grimoire.local"  # name announced on the home network, instead of the computer's IP
+START_TOKEN = secrets.token_hex(4)  # part of every ETag: answers cached before a restart are never reused
 # explicit types: on Windows the registry can map .js to text/plain, which browsers refuse for modules
 for mime_type, extension in (("text/javascript", ".js"), ("text/css", ".css"), ("application/json", ".json"),
                              ("application/manifest+json", ".webmanifest"), ("image/svg+xml", ".svg"),
@@ -133,13 +139,20 @@ class Store:
         # spell files are renamed when a level changes: reads, writes and renames of spell files take turns
         self.spell_lock = threading.RLock()
         self._spell_paths, self._scanned = {}, None
+        # with thousands of spells, reading and completing the sheets again for every request is what makes the app
+        # slow: sheets are kept in memory (checked against the file), completed sheets until any sheet changes
+        self._sheets = {}          # id -> (path, mtime_ns, sheet); the sheets returned must not be changed in place
+        self.generation = 0        # +1 when a sheet changes: completed and light sheets are made again
+        self.completed = {}        # id -> (generation, expand_spell), see completed_spell
+        self.light = {}            # id -> (generation, light sheet), see light_spell
+        self.version = 0           # +1 on every write: part of the ETags
 
     @staticmethod
     def _read(path):
         return json.loads(path.read_text(encoding="utf-8"))
 
-    @staticmethod
-    def _write(path, data):
+    def _write(self, path, data):
+        self.version += 1
         tmp = path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         for attempt in range(20):
@@ -182,9 +195,23 @@ class Store:
         return self.spells / f"{'x' if level is None else level}-{slug}--{spell_id}.json"
 
     def spell(self, spell_id):
+        """The saved sheet (from memory when the file hasn't changed), or None. Don't change it in place."""
         with self.spell_lock:
             path = self._spell_path(spell_id)
-            return self._read(path) if path and path.exists() else None
+            if not path:
+                return None
+            try:
+                mtime = path.stat().st_mtime_ns
+            except OSError:
+                return None
+            cached = self._sheets.get(spell_id)
+            if cached and cached[0] == path and cached[1] == mtime:
+                return cached[2]
+            data = self._read(path)
+            if cached:
+                self.generation += 1  # changed outside the app
+            self._sheets[spell_id] = (path, mtime, data)
+            return data
 
     def save_spell(self, data):
         with self.spell_lock:
@@ -195,6 +222,8 @@ class Store:
             if old and old != path:
                 old.unlink(missing_ok=True)
             self._spell_paths[data["id"]] = path
+            self._sheets[data["id"]] = (path, path.stat().st_mtime_ns, data)
+            self.generation += 1
 
     def delete_spell(self, spell_id):
         """Deletes every file of a spell (an old <id>.json copy too). False if there was none."""
@@ -206,6 +235,9 @@ class Store:
             for path in files:
                 path.unlink(missing_ok=True)
             self._spell_paths.pop(spell_id, None)
+            self._sheets.pop(spell_id, None)
+            self.generation += 1
+            self.version += 1
             return bool(files)
 
     def name_spell_files(self, ids=None):
@@ -226,6 +258,9 @@ class Store:
                 if target != path:
                     os.replace(path, target)
                     self._spell_paths[spell_id] = target
+                    cached = self._sheets.pop(spell_id, None)
+                    if cached and cached[0] == path:
+                        self._sheets[spell_id] = (target, target.stat().st_mtime_ns, cached[2])
                     renamed += 1
             return renamed
 
@@ -242,12 +277,16 @@ class Store:
         return self._read(path)
 
     def save_book(self, book):
-        """Saves a book and renames the files of its spells whose level changed."""
+        """Saves a book and renames the files of the spells whose level (or removal) changed."""
         book["updated_at"] = now()
         path = self.book_file(book["id"])
-        before = {entry["id"] for entry in self._read(path).get("spells", [])} if path.exists() else set()
+        state = lambda entries: {e["id"]: (e["level"], bool(e.get("removed_at"))) for e in entries}  # noqa: E731
+        before = state(self._read(path).get("spells", [])) if path.exists() else {}
+        after = state(book.get("spells", []))
         self._write(path, book)
-        self.name_spell_files(before | {entry["id"] for entry in book.get("spells", [])})
+        changed = {i for i in before.keys() | after.keys() if before.get(i) != after.get(i)}
+        if changed:
+            self.name_spell_files(changed)
 
     def all_books(self):
         return [self._read(p) for p in sorted(self.books.glob("*.json"))]
@@ -344,6 +383,8 @@ class Store:
                 if metric != data:
                     self._write(path, metric)
                     converted += 1
+            self._sheets.clear()
+            self.generation += 1
         return converted
 
 
@@ -710,14 +751,14 @@ def character_summary(character, books):
 
 
 def full_character(store, character_id):
-    """Preparation, plus every spell of the character's books (merged and expanded) and the book summaries."""
+    """Preparation, plus every spell of the character's books (merged, as light sheets) and the book summaries."""
     character = store.character(character_id)
     books = store.books_of(character_id)
     entries = []
     for merged_entry in character_spells(books).values():
-        data = store.spell(merged_entry["id"])
-        if data:
-            entries.append({**merged_entry, "spell": expand_spell(store, data)})
+        light = light_spell(store, merged_entry["id"])
+        if light:
+            entries.append({**merged_entry, "spell": light})
     entries.sort(key=lambda v: (v["level"], v["spell"]["name"].lower()))
     return {
         **character_summary(character, books),
@@ -981,6 +1022,58 @@ def merge_base(data, sheets):
     return result
 
 
+def completed_spell(store, spell_id):
+    """expand_spell of a saved sheet, kept in memory until any sheet changes. None if there is no such sheet."""
+    generation = store.generation
+    cached = store.completed.get(spell_id)
+    if cached and cached[0] == generation:
+        return cached[1]
+    data = store.spell(spell_id)
+    if data is None:
+        return None
+    value = expand_spell(store, data)
+    store.completed[spell_id] = (generation, value)
+    return value
+
+
+# What lists (cards, rows, scrolls) don't need: the full sheet comes from GET /api/spells/<id> when it is opened
+LIGHT_LEFT_OUT = ("description_html", "description_text", "linked", "references", "also_appears_in", "levels")
+COST_LABEL_RE = re.compile(r"^(?:(?:arcane|divine)\s+)?material\s+components?\s*:|^xp\s+cost\s*:", re.I)
+DICE_RE = re.compile(r"\b\d+d\d+(?:\s*[+×x]\s*\d+)?\b")  # the same as DICE_RE in app.js
+
+
+def cost_paragraphs(description_html):
+    """The "Material Component: …" and "XP Cost: …" paragraphs: the interface reads the scroll costs from them."""
+    found = []
+    for paragraph in re.findall(r"<p>.*?</p>", description_html or "", re.S):
+        text = html.unescape(re.sub(r"<[^>]+>", "", paragraph[3:-4])).strip()
+        if COST_LABEL_RE.match(text):
+            found.append(paragraph)
+    return "".join(found)
+
+
+def light_spell(store, spell_id):
+    """The completed sheet without the long texts, plus what the lists need from them: `costs_html` (and
+    `base_costs_html` when the components come from the base spell) and `has_dice` (for Empower/Maximize)."""
+    generation = store.generation
+    cached = store.light.get(spell_id)
+    if cached and cached[0] == generation:
+        return cached[1]
+    full = completed_spell(store, spell_id)
+    if full is None:
+        return None
+    light = {key: value for key, value in full.items() if key not in LIGHT_LEFT_OUT}
+    light["costs_html"] = cost_paragraphs(full.get("description_html"))
+    inherited = full.get("inherited_from") or {}
+    base_name = (inherited.get("keys") or {}).get("components")
+    base = next((b for b in inherited.get("chain", []) if b["name"] == base_name), None)
+    if base:
+        light["base_costs_html"] = cost_paragraphs((store.spell(base["id"]) or {}).get("description_html"))
+    light["has_dice"] = bool(DICE_RE.search(full.get("description_html") or ""))
+    store.light[spell_id] = (generation, light)
+    return light
+
+
 def expand_spell(store, data):
     """Sheet ready for the interface: completed with merge_base, plus the referenced sheets
     (completed too) in "linked". The saved file stays as it is on dndtools."""
@@ -991,16 +1084,17 @@ def expand_spell(store, data):
 
 
 def full_book(store, book):
+    """The book with its spells ({id, level, added_at}: the sheets come with the character, GET /api/characters/<id>)
+    and the removed ones (with name and school, for Settings)."""
     entries, removed = [], []
     for entry in book.get("spells", []):
-        data = store.spell(entry["id"])
-        if not data:
-            continue
         if entry.get("removed_at"):
-            removed.append({**entry, "name": data["name"], "school": data.get("school", "")})
-        else:
-            entries.append({**entry, "spell": expand_spell(store, data)})
-    entries.sort(key=lambda v: (v["level"], v["spell"]["name"].lower()))
+            data = store.spell(entry["id"])
+            if data:
+                removed.append({**entry, "name": data["name"], "school": data.get("school", "")})
+        elif store.spell(entry["id"]) is not None:
+            entries.append(entry)
+    entries.sort(key=lambda v: v["level"])
     removed.sort(key=lambda v: v["removed_at"], reverse=True)
     try:
         character_name = store.character(book.get("character")).get("name", "")
@@ -1016,6 +1110,16 @@ def spell_in_use(store, spell_id):
     if spell_id in ids:
         return True
     return any(spell_id in linked_ids(store, data) for data in map(store.spell, ids) if data)
+
+
+def unused_spells(store, spell_ids):
+    """The spells among spell_ids that no book has and no spell of a book refers to (see spell_in_use)."""
+    ids = {entry["id"] for book in store.all_books() for entry in book.get("spells", [])}
+    linked = set()
+    for data in map(store.spell, ids):
+        if data:
+            linked.update(linked_ids(store, data))
+    return [spell_id for spell_id in spell_ids if spell_id not in ids and spell_id not in linked]
 
 
 def restore_spell(book, spell_id, level=None):
@@ -1042,12 +1146,24 @@ IMPORT_WORKERS = 3   # spells downloaded at the same time during an import (no l
 
 
 class Job:
-    def __init__(self, kind):
+    """A download that runs in the background: the page follows it (GET /api/jobs/<id>) and lists the recent ones
+    (GET /api/jobs), so its progress stays visible whatever the user does, even after a reload."""
+
+    def __init__(self, kind, **info):
         self.id = secrets.token_hex(8)
         self.started = time.time()
+        self.ended = None
         self.lock = threading.Lock()
         self.data = {"id": self.id, "kind": kind, "done": 0, "total": 0, "finished": False, "error": None,
-                     "cancelled": False}
+                     "cancelled": False, "started_at": now(), "finished_at": None, **info}
+
+    def summary(self):
+        """Without the lists (search results, added spells…), only how many there are."""
+        with self.lock:
+            data = {**self.data, **self._timing()}
+        lists = ("results", "added", "skipped", "failed")
+        return {**{k: v for k, v in data.items() if k not in lists},
+                "counts": {k: len(data.get(k) or []) for k in lists}}
 
     @property
     def cancelled(self):
@@ -1077,19 +1193,49 @@ class Job:
 
     def snapshot(self):
         with self.lock:
-            return json.loads(json.dumps(self.data))
+            return json.loads(json.dumps({**self.data, **self._timing()}))
+
+    def _timing(self):
+        """elapsed seconds, and `remaining`: the seconds still needed at the pace so far (None until there is a
+        pace to go by). A search finds its pages as it goes, so its estimate grows with them."""
+        elapsed = (self.ended or time.time()) - self.started
+        done, total = self.data["done"], self.data["total"]
+        remaining = None
+        if not self.data["finished"] and not self.data["cancelled"] and done and total > done and elapsed >= 1:
+            remaining = round(elapsed / done * (total - done))
+        return {"elapsed": round(elapsed, 1), "remaining": remaining}
+
+    def end(self, **values):
+        with self.lock:
+            self.ended = time.time()
+            self.data.update(finished=True, finished_at=now(), **values)
 
 
 JOBS = {}
 JOBS_LOCK = threading.Lock()
+# set when the server stops: the downloads still running end without saving (the thread pools would otherwise
+# keep the process alive until every queued spell is done, still writing to the books after "Grimoire stopped")
+STOPPING = threading.Event()
 
 
-def start_job(kind, work):
-    """Runs work(job) in a thread; errors end up in job["error"]."""
-    job = Job(kind)
+def cancel_all_jobs():
+    STOPPING.set()
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            job.cancel()
+
+
+def forget_old_jobs():
     with JOBS_LOCK:
         for old_id in [i for i, j in JOBS.items() if j.data["finished"] and time.time() - j.started > JOB_LIFETIME]:
             del JOBS[old_id]
+
+
+def start_job(kind, work, **info):
+    """Runs work(job) in a thread; errors end up in job["error"]. info: label, book… shown by the page."""
+    job = Job(kind, **info)
+    forget_old_jobs()
+    with JOBS_LOCK:
         JOBS[job.id] = job
 
     def run():
@@ -1105,7 +1251,7 @@ def start_job(kind, work):
             job.update(error=f"Internal error: {error}")
             raise
         finally:
-            job.update(finished=True)
+            job.end()
 
     threading.Thread(target=run, daemon=True).start()
     return job
@@ -1147,6 +1293,8 @@ def import_spells(store, book_id, urls, job):
             return
         try:
             data = download_with_linked(store, url)
+            if STOPPING.is_set():
+                return
             with LOCK:
                 book = store.book(book_id)
                 if book.get("unavailable"):
@@ -1301,23 +1449,50 @@ def valid_level(value):
     return level
 
 
-def make_handler(store, network):
+def make_handler(store, network, control=None):
+    """control: {"token", "server", "quiet"} for /api/shutdown and the request log."""
+    control = control if control is not None else {}
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "Grimoire/1.0"
 
         def log_message(self, fmt, *args):
-            if "--quiet" not in sys.argv:
+            if not control.get("quiet") and "--quiet" not in sys.argv:
                 sys.stderr.write("  %s\n" % (fmt % args))
 
         # --- responses ---
-        def _json(self, data, status=HTTPStatus.OK):
-            body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        def _json(self, data, status=HTTPStatus.OK, etag=None):
+            body = json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            # an ETag lets the browser keep the answer and ask "has it changed?" next time (304)
+            self._send(status, "application/json; charset=utf-8", body, "no-cache" if etag else "no-store", etag)
+
+        def _send(self, status, content_type, body, cache, etag=None):
+            """Sends a body, compressed when the browser accepts it (a big book is 10 times smaller for the phone)."""
+            if etag and self.headers.get("If-None-Match") == etag:
+                self.send_response(HTTPStatus.NOT_MODIFIED)
+                self.send_header("ETag", etag)
+                self.send_header("Cache-Control", cache)
+                self.end_headers()
+                return
+            compress = len(body) > 1400 and "gzip" in (self.headers.get("Accept-Encoding") or "") and (
+                content_type.startswith(("text/", "application/json", "image/svg")) or "javascript" in content_type)
+            if compress:
+                body = gzip.compress(body, compresslevel=5)
             self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            self.send_header("Cache-Control", cache)
+            self.send_header("Vary", "Accept-Encoding")
+            if compress:
+                self.send_header("Content-Encoding", "gzip")
+            if etag:
+                self.send_header("ETag", etag)
             self.end_headers()
             self.wfile.write(body)
+
+        def _data_etag(self):
+            """Changes with every write of the data (and with every start of the server)."""
+            return f'"{START_TOKEN}-{store.version}"'
 
         def _body(self):
             length = int(self.headers.get("Content-Length") or 0)
@@ -1339,27 +1514,23 @@ def make_handler(store, network):
                     error = ensure()
                     if error:
                         raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, error)
-                    content = file.read_bytes()
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    self.send_header("Content-Length", str(len(content)))
-                    self.send_header("Cache-Control", "no-cache")
-                    self.end_headers()
-                    self.wfile.write(content)
+                    self._send_file(file, "application/json; charset=utf-8")
                     return
             file = (WEB / relative).resolve()
             if WEB not in file.parents or not file.is_file():
                 file = WEB / "index.html"
-            content = file.read_bytes()
             mime_type = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
             if mime_type.startswith("text/") or mime_type in ("application/javascript", "image/svg+xml"):
                 mime_type += "; charset=utf-8"
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", mime_type)
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Cache-Control", "no-cache")
-            self.end_headers()
-            self.wfile.write(content)
+            self._send_file(file, mime_type)
+
+        def _send_file(self, file, content_type):
+            info = file.stat()
+            etag = f'"{info.st_mtime_ns:x}-{info.st_size:x}"'
+            if self.headers.get("If-None-Match") == etag:
+                self._send(HTTPStatus.OK, content_type, b"", "no-cache", etag)
+            else:
+                self._send(HTTPStatus.OK, content_type, file.read_bytes(), "no-cache", etag)
 
         def _route(self, method):
             path = urlparse(self.path).path
@@ -1380,6 +1551,8 @@ def make_handler(store, network):
         def _handle(self, method):
             try:
                 self._route(method)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # the browser left the page before the answer was sent
             except ApiError as error:
                 self._json({"error": error.message}, error.status)
             except dndtools.DndtoolsError as error:
@@ -1416,7 +1589,8 @@ def make_handler(store, network):
                 book_id = parts[1]
                 if len(parts) == 2:
                     if method == "GET":
-                        return full_book(store, store.book(book_id))
+                        etag = self._data_etag()  # before reading: a change made meanwhile gets a newer ETag
+                        return full_book(store, store.book(book_id)), HTTPStatus.OK, etag
                     if method == "PATCH":
                         return self._edit_book(book_id, self._body())
                     if method == "DELETE":
@@ -1436,6 +1610,10 @@ def make_handler(store, network):
                         return self._change_level(book_id, parts[3], self._body())
                     if method == "DELETE":
                         return self._remove(book_id, parts[3])
+                if parts[2:] == ["spells", "remove"] and method == "POST":
+                    return self._remove_many(book_id, self._body())
+                if parts[2:] == ["spells", "restore"] and method == "POST":
+                    return self._restore_many(book_id, self._body())
                 if len(parts) == 5 and parts[2] == "spells" and parts[4] == "restore" and method == "POST":
                     return self._restore(book_id, parts[3])
                 if len(parts) == 5 and parts[2] == "spells" and parts[4] == "forever" and method == "DELETE":
@@ -1448,7 +1626,11 @@ def make_handler(store, network):
                     return self._create_character(self._body())
             if len(parts) == 2 and parts[0] == "characters":
                 if method == "GET":
-                    return full_character(store, parts[1])
+                    etag = self._data_etag()
+                    if self.headers.get("If-None-Match") == etag:
+                        store.character(parts[1])  # 404 if it was deleted
+                        return {}, HTTPStatus.OK, etag  # answered with 304
+                    return full_character(store, parts[1]), HTTPStatus.OK, etag
                 if method == "PATCH":
                     return self._edit_character(parts[1], self._body())
                 if method == "DELETE":
@@ -1479,8 +1661,22 @@ def make_handler(store, network):
                 return dndtools_filters()
             if parts == ["dndtools", "search"] and method == "POST":
                 filters = search.clean_filters(self._body().get("filters"))
-                job = start_job("search", lambda job: run_search(job, filters))
+                job = start_job("search", lambda job: run_search(job, filters), label="Searching dndtools", filters=filters)
                 return job.snapshot(), HTTPStatus.ACCEPTED
+            if parts == ["jobs"] and method == "GET":
+                forget_old_jobs()
+                with JOBS_LOCK:
+                    jobs = sorted(JOBS.values(), key=lambda j: j.started)
+                return [job.summary() for job in jobs]
+            if parts == ["instance"] and method == "GET":
+                return {"id": START_TOKEN, "data": str(store.books.parent.resolve())}
+            if parts == ["shutdown"] and method == "POST":
+                # only the --stop command knows the token (it is in the data folder, which a website can't read)
+                body = self._body() if (self.headers.get("Content-Type") or "").startswith("application/json") else {}
+                if not control.get("token") or not secrets.compare_digest(str(body.get("token", "")), control["token"]):
+                    raise ApiError(HTTPStatus.FORBIDDEN, "Not allowed.")
+                threading.Thread(target=control["server"].shutdown, daemon=True).start()
+                return {"ok": True}
             if len(parts) in (2, 3) and parts[0] == "jobs":
                 job = JOBS.get(parts[1])
                 if not job:
@@ -1490,6 +1686,12 @@ def make_handler(store, network):
                 if parts[2:] == ["cancel"] and method == "POST":
                     job.cancel()
                     return job.snapshot()
+
+            if len(parts) == 2 and parts[0] == "spells" and method == "GET":
+                sheet = completed_spell(store, parts[1])
+                if sheet is None:
+                    raise KeyError(parts[1])
+                return sheet
 
             if len(parts) == 2 and parts[0] == "spells" and method == "PUT":
                 return self._edit_handwritten(parts[1], self._body())
@@ -1724,8 +1926,11 @@ def make_handler(store, network):
             urls = body.get("urls")
             if not isinstance(urls, list) or not urls:
                 raise ApiError(HTTPStatus.BAD_REQUEST, "Choose at least one spell to add.")
-            ensure_available(store.book(book_id))
-            job = start_job("import", lambda job: import_spells(store, book_id, urls, job))
+            book = store.book(book_id)
+            ensure_available(book)
+            job = start_job("import", lambda job: import_spells(store, book_id, urls, job),
+                            label=f"Adding spells to “{book['name']}”", book=book_id, book_name=book["name"],
+                            character=book.get("character"), caster_class=book.get("caster_class"))
             return job.snapshot(), HTTPStatus.ACCEPTED
 
         def _add_handwritten(self, book_id, body):
@@ -1816,6 +2021,53 @@ def make_handler(store, network):
                 clean_character(store, book.get("character"))
                 sheet_deleted = not spell_in_use(store, spell_id) and store.delete_spell(spell_id)
             return {**full_book(store, book), "sheet_deleted": sheet_deleted}
+
+        @staticmethod
+        def _spell_ids(body):
+            ids = body.get("ids")
+            if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "Choose at least one spell.")
+            return list(dict.fromkeys(ids))
+
+        def _remove_many(self, book_id, body):
+            """Several spells at once: hidden like _remove, or with `forever` deleted like _delete_forever
+            (shown and removed ones). Spells the book doesn't have are ignored; 404 if it has none of them."""
+            ids = self._spell_ids(body)
+            forever = body.get("forever") is True
+            with LOCK:
+                book = store.book(book_id)
+                ensure_available(book)
+                wanted = set(ids)
+                if forever:
+                    hit = [v["id"] for v in book["spells"] if v["id"] in wanted]
+                    book["spells"] = [v for v in book["spells"] if v["id"] not in wanted]
+                else:
+                    hit = []
+                    stamp = now()
+                    for entry in shown(book["spells"]):
+                        if entry["id"] in wanted:
+                            entry["removed_at"] = stamp
+                            hit.append(entry["id"])
+                if not hit:
+                    raise KeyError(book_id)
+                store.save_book(book)
+                answer = {"count": len(hit)}
+                if forever:
+                    clean_character(store, book.get("character"))
+                    unused = unused_spells(store, hit)
+                    answer = {"count": len(hit), "sheets_deleted": sum(1 for i in unused if store.delete_spell(i))}
+            return {**full_book(store, book), **answer, "ids": hit}
+
+        def _restore_many(self, book_id, body):
+            ids = self._spell_ids(body)
+            with LOCK:
+                book = store.book(book_id)
+                ensure_available(book)
+                restored = [spell_id for spell_id in ids if restore_spell(book, spell_id)]
+                if not restored:
+                    raise KeyError(book_id)
+                store.save_book(book)
+            return {**full_book(store, book), "restored": len(restored)}
 
         def _restore(self, book_id, spell_id):
             with LOCK:
@@ -1986,6 +2238,101 @@ class LoopbackV6Server(ThreadingHTTPServer):
     address_family = socket.AF_INET6
 
 
+# ---------- one server per data folder, started and stopped by the scripts ----------
+def run_file(data_folder):
+    """<data>/server.json, written by the running server: id, pid, port, address, data folder, stop token."""
+    return Path(data_folder) / "server.json"
+
+
+def running_instance(data_folder):
+    """The server already running on this data folder (its run file), or None if there isn't one."""
+    try:
+        info = json.loads(run_file(data_folder).read_text(encoding="utf-8"))
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(info['port'])}/api/instance", timeout=3) as response:
+            answer = json.load(response)
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    same = answer.get("id") == info.get("id") and answer.get("data") == str(Path(data_folder).resolve())
+    return info if same else None
+
+
+def open_browser(address):
+    threading.Timer(0.5, webbrowser.open, args=(address,)).start()
+
+
+def stop_instance(data_folder):
+    """--stop: asks the server to stop (it cleans up), and ends the process if it doesn't answer."""
+    info = running_instance(data_folder)
+    if not info:
+        run_file(data_folder).unlink(missing_ok=True)  # left by a server that is gone
+        print("Grimoire is not running.")
+        return 0
+    request = urllib.request.Request(f"http://127.0.0.1:{int(info['port'])}/api/shutdown", method="POST",
+                                     data=json.dumps({"token": info.get("token", "")}).encode(),
+                                     headers={"Content-Type": "application/json"})
+    try:
+        urllib.request.urlopen(request, timeout=5).read()
+    except OSError:
+        pass
+    for _ in range(50):
+        if not running_instance(data_folder):
+            print("Grimoire stopped.")
+            return 0
+        time.sleep(0.2)
+    try:
+        os.kill(int(info["pid"]), signal.SIGTERM)
+    except (OSError, ValueError):
+        pass
+    run_file(data_folder).unlink(missing_ok=True)
+    print("Grimoire stopped.")
+    return 0
+
+
+def start_in_background(args, argv):
+    """--start: the server runs as a separate process without a window (its output goes to <data>/server.log);
+    this command returns as soon as the server answers, or shows why it didn't start."""
+    existing = running_instance(args.data)
+    if existing:
+        print(f"Grimoire is already running at {existing['address']}")
+        if not args.no_browser:
+            webbrowser.open(existing["address"])
+        return 0
+    python = Path(sys.executable)
+    options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name == "nt":
+        if python.with_name("pythonw.exe").exists():
+            python = python.with_name("pythonw.exe")
+        options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        options["start_new_session"] = True  # keeps running when the terminal is closed
+    command = [str(python), "-B", str(APP_DIR / "server.py"), *[a for a in argv if a != "--start"], "--background"]
+    try:
+        Path(args.data).mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        print(f"Grimoire did not start: the data folder {args.data} can't be used ({error.strerror}).")
+        return 1
+    log = Path(args.data) / "server.log"
+    size_before = log.stat().st_size if log.exists() else 0
+    process = subprocess.Popen(command, cwd=APP_DIR, **options)
+    for _ in range(600):  # up to a minute (the first start of a big library renames its files)
+        info = running_instance(args.data)
+        if info:
+            print(f"Grimoire is running at {info['address']}\nStop it with the stop script (or: python3 server.py --stop).")
+            return 0
+        if process.poll() is not None:
+            break
+        time.sleep(0.1)
+    try:
+        with open(log, encoding="utf-8", errors="replace") as file:
+            if log.stat().st_size >= size_before:  # otherwise the server started a new log
+                file.seek(size_before)
+            output = file.read().strip()
+    except OSError:
+        output = ""
+    print("Grimoire did not start." + (f"\n{output}" if output else ""))
+    return 1
+
+
 def main():
     parser = argparse.ArgumentParser(description="Grimoire: local spellbooks.")
     parser.add_argument("--port", type=int, default=8765)
@@ -1996,7 +2343,34 @@ def main():
                         help=f"name announced on the home network, ending in .local (default: {LOCAL_NAME})")
     parser.add_argument("--no-browser", action="store_true", help="do not open the browser")
     parser.add_argument("--quiet", action="store_true", help="do not log requests")
+    parser.add_argument("--start", action="store_true",
+                        help="run in the background without a window, and return when it answers")
+    parser.add_argument("--stop", action="store_true", help="stop the server running on this data folder")
+    parser.add_argument("--background", action="store_true", help=argparse.SUPPRESS)  # output to <data>/server.log
     args = parser.parse_args()
+    if args.stop:
+        sys.exit(stop_instance(args.data))
+    if MISSING_MODULE:
+        sys.exit(f"Missing Python module: {MISSING_MODULE}. Install it with: python3 -m pip install -r requirements.txt "
+                 "(or use the start script for your system).")
+    if args.start:
+        sys.exit(start_in_background(args, sys.argv[1:]))
+    try:
+        Path(args.data).mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        sys.exit(f"The data folder {args.data} can't be used ({error.strerror}).")
+    if args.background or sys.stdout is None:  # no window (pythonw): everything goes to the log
+        log = Path(args.data) / "server.log"
+        if log.exists() and log.stat().st_size > 2_000_000:
+            os.replace(log, log.with_suffix(".log.old"))
+        sys.stdout = sys.stderr = open(log, "a", encoding="utf-8", buffering=1)
+        print(f"--- {now()}")
+    existing = running_instance(args.data)
+    if existing:
+        print(f"Grimoire is already running at {existing['address']}")
+        if not args.no_browser:
+            webbrowser.open(existing["address"])
+        sys.exit(0)
     if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.local", args.name):
         sys.exit("--name must be one word of letters, digits and hyphens followed by .local, like my-grimoire.local")
 
@@ -2020,7 +2394,8 @@ def main():
     host = "0.0.0.0" if args.network else "127.0.0.1"
     server = None
     network = Network(None, args.network, args.name)
-    handler = make_handler(store, network)
+    control = {"quiet": args.quiet or args.background, "token": secrets.token_urlsafe(24)}
+    handler = make_handler(store, network, control)
     network.handler = handler
     for port in range(args.port, args.port + 20):
         try:
@@ -2033,13 +2408,14 @@ def main():
 
     port = server.server_address[1]
     network.port = port
+    control["server"] = server
     try:
         loopback6 = LoopbackV6Server(("::1", port), handler)
         threading.Thread(target=loopback6.serve_forever, daemon=True).start()
     except OSError:
         pass  # no IPv6 on this computer: browsers use 127.0.0.1 anyway
     address = local_address(args.name, port)
-    print(f"Grimoire running at {address}  (Ctrl+C to stop)")
+    print(f"Grimoire running at {address}  ({'stop it with the stop script' if args.background else 'Ctrl+C to stop'})")
     if args.network:
         status = network.status()
         if status["address"]:
@@ -2050,17 +2426,29 @@ def main():
             print("This computer doesn't seem to be connected to a local network.")
         print("Warning: there is no password, anyone on this network can edit your books.")
     print(f"Data in {Path(args.data).resolve()}", flush=True)
+    info = {"id": START_TOKEN, "pid": os.getpid(), "port": port, "address": address,
+            "data": str(Path(args.data).resolve()), "token": control["token"], "started_at": now()}
+    tmp = run_file(args.data).with_suffix(".tmp")
+    tmp.write_text(json.dumps(info, indent=2), encoding="utf-8")
+    os.replace(tmp, run_file(args.data))
     if not args.no_browser:
-        threading.Timer(0.5, webbrowser.open, args=(address,)).start()
+        open_browser(address)
     # stopped by the system (kill, logout): same clean exit as Ctrl+C, so the name announcement stops too
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
-        server.serve_forever()
+        server.serve_forever()  # returns after /api/shutdown (--stop)
+        print("Grimoire stopped.")
     except KeyboardInterrupt:
         print("\nGrimoire stopped.")
     finally:
+        cancel_all_jobs()
         network.close()
         server.server_close()
+        try:
+            if json.loads(run_file(args.data).read_text(encoding="utf-8")).get("id") == START_TOKEN:
+                run_file(args.data).unlink()
+        except (OSError, ValueError):
+            pass
 
 
 if __name__ == "__main__":

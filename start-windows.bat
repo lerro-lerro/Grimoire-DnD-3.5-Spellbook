@@ -1,5 +1,6 @@
 @echo off
-rem Starts Grimoire on Windows: double-click this file.
+rem Starts Grimoire on Windows in the background: double-click this file.
+rem The window closes by itself once the server answers; stop it with stop-windows.bat.
 rem From a terminal: start-windows.bat --network   (options go to server.py)
 rem It uses Python 3.9+ with lxml. If lxml is missing, it is installed once in a private folder (.venv).
 setlocal
@@ -35,9 +36,15 @@ if errorlevel 1 goto nopip
 set "PYTHON=.venv\Scripts\python.exe"
 
 :run
-%PYTHON% -B server.py %*
-if errorlevel 1 pause
-exit /b
+rem the server runs on its own without a window (pythonw); this returns once it answers
+%PYTHON% -B server.py --start %*
+if errorlevel 1 (
+  echo.
+  echo Grimoire did not start.
+  pause
+  exit /b 1
+)
+exit /b 0
 
 :nopython
 echo Grimoire needs Python 3.9 or newer.

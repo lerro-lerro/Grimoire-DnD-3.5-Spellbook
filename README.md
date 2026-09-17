@@ -15,6 +15,7 @@ full spell is saved on your computer (with measurements in metric units).
   metamagic feats. Sorcerers and similar classes spend slots instead.
 - **Scrolls:** market price and scribing cost for each spell, and a planner that fits a batch of scrolls to your gold.
 - **Everyday tools:** favorites, filters, folding levels, removed spells you can restore, and books marked as lost or stolen.
+- **Tidying up:** "Select" in a spellbook picks several spells at once (or a whole level) and removes them together, with Undo.
 - **Rules at hand:** the full text of every spell, with clickable conditions from the d20 SRD.
 - **Phone:** the layout works on phones, and a QR code opens the grimoire from any device on your Wi-Fi.
 
@@ -24,32 +25,42 @@ full spell is saved on your computer (with measurements in metric units).
 - [lxml](https://lxml.de/) (the start scripts install it if needed)
 - An internet connection when you add spells. Everything you download stays on your computer.
 
-## Start
+## Start and stop
 
-| System  | How |
-|---------|-----|
-| Linux   | run `./start-linux.sh` |
-| macOS   | double-click `start-mac.command` (the first time: right-click → Open) |
-| Windows | double-click `start-windows.bat` |
+| System  | Start | Stop |
+|---------|-------|------|
+| Linux   | `./start-linux.sh` | `./stop-linux.sh` |
+| macOS   | double-click `start-mac.command` (the first time: right-click → Open) | double-click `stop-mac.command` |
+| Windows | double-click `start-windows.bat` | double-click `stop-windows.bat` |
 
-The browser opens at `http://my-grimoire.localhost:8765`. To stop, press Ctrl+C in the terminal window
-(or close it).
+The grimoire runs in the background, without a window: the start script returns (or its window closes) as soon
+as the server answers, and the browser opens at `http://my-grimoire.localhost:8765`. It keeps running until you
+use the stop script or turn off the computer. Starting it again while it runs just opens the browser.
+
+On Linux, `./start-linux.sh --add-to-menu` adds **Grimoire** and **Stop Grimoire** to the applications menu,
+so you can start and stop it without a terminal.
+
+Downloads from dndtools keep going while you use the app: a panel in the corner shows their progress and the
+time left, and tells you when they are done, even after you close the dialog or reload the page.
 
 Without the scripts:
 
 ```bash
 python3 -m pip install -r requirements.txt
-python3 server.py
+python3 server.py            # in this terminal: Ctrl+C stops it
+python3 server.py --start    # in the background
+python3 server.py --stop
 ```
 
-The server also accepts these options:
+The server also accepts these options (the start scripts pass them on):
 
 - `--port 9000` uses another port.
-- `--data /some/folder` keeps the data in another folder.
+- `--data /some/folder` keeps the data in another folder (use the same option to stop it).
 - `--network` lets phones connect right away.
 - `--no-browser` doesn't open the browser.
 
-`python3 server.py --help` lists them all.
+`python3 server.py --help` lists them all. In the background, the server writes its messages to
+`data/server.log`.
 
 ## From your phone
 
@@ -68,7 +79,7 @@ To back them up, copy that folder. It is not part of the repository.
 server.py      the web server and its API (start here)
 grimoire/      dndtools download and search, metric units, SRD conditions, metamagic feats
 web/           the interface: HTML, CSS and JavaScript, no build step
-start-*        start scripts for Linux, macOS and Windows
+start-*        start scripts for Linux, macOS and Windows (stop-* stop the server)
 ```
 
 ## Credits

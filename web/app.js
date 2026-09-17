@@ -80,9 +80,16 @@ const state = {
   onlyOwned: false,
   onlyFavorites: false,
   saveQueue: Promise.resolve(), // prepared-spell saves run one at a time
+  selecting: false,  // Spellbook tab: cards are picked (to remove several at once) instead of opened
+  selected: new Set(), // ids of the picked spells
+  lastPicked: null,  // for shift-click ranges
+  selectionLevels: new Map(), // level -> ids of the spells shown in it
+  selectionOrder: [], // ids of the spells shown, in page order
 };
 
 // ---------- utilities ----------
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
 function esc(text) {
   return String(text ?? "").replace(/[&<>"']/g, (c) => ({
     "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
@@ -196,6 +203,168 @@ function askConfirm(title, text, label = "Confirm", option = null) {
   });
 }
 
+// ---------- long lists: only what changed is redrawn ----------
+// With thousands of spells, rebuilding every card or row after each click takes seconds (on a phone even more).
+// patchList keeps the elements whose HTML didn't change; patchSections does it for the level sections, whose
+// "head" (title, pips) and rows are compared separately.
+const patchMemory = new WeakMap(); // element -> {key, html}
+
+// A row whose HTML is only built when it is needed (a big list shows its first rows before building the others)
+function lazyRow(key, make) {
+  let html;
+  return {
+    key,
+    get html() {
+      if (html === undefined) html = make().trim();
+      return html;
+    },
+  };
+}
+
+// items: [{key, html}], each html a single element; decorate(element) runs on the elements it creates
+function patchList(parent, items, decorate = null) {
+  const old = new Map();
+  for (const child of [...parent.children]) {
+    const memo = patchMemory.get(child);
+    if (memo && !old.has(memo.key)) old.set(memo.key, { el: child, html: memo.html });
+    else child.remove();
+  }
+  const elements = new Array(items.length);
+  const fresh = [];
+  items.forEach((item, i) => {
+    const kept = old.get(item.key);
+    if (kept && kept.html === item.html) {
+      elements[i] = kept.el;
+      old.delete(item.key);
+    } else {
+      fresh.push(i);
+    }
+  });
+  if (fresh.length) {
+    const template = document.createElement("template");
+    template.innerHTML = fresh.map((i) => items[i].html).join("");
+    const created = [...template.content.children];
+    fresh.forEach((i, n) => {
+      elements[i] = created[n];
+      patchMemory.set(created[n], { key: items[i].key, html: items[i].html });
+      decorate?.(created[n]);
+    });
+  }
+  for (const { el } of old.values()) el.remove();
+  let cursor = parent.firstElementChild;
+  for (const el of elements) {
+    if (el === cursor) cursor = cursor.nextElementSibling;
+    else parent.insertBefore(el, cursor);
+  }
+}
+
+// sections: [{key, level, className, id?, head, listTag, listClass, rows: [{key, html}], empty}]
+// Inside a section: the head nodes, then the list (or the `empty` element when there are no rows).
+// When most rows are new (a big book just opened), CHUNK rows are drawn now and the others right after,
+// so the page shows up at once instead of after every card has been built.
+const sectionParts = new WeakMap();
+const CHUNK = 150;
+const pendingSections = new WeakMap(); // container -> timer of the next piece
+const drawingInPieces = new WeakSet();   // containers whose rows are being drawn piece by piece
+
+function patchSections(container, sections, decorate = null) {
+  if (pendingSections.has(container)) {
+    clearTimeout(pendingSections.get(container));
+    pendingSections.delete(container);
+  }
+  let total = 0;
+  let drawnBefore = 0;
+  for (const section of sections) total += section.rows.length;
+  for (const child of container.children) drawnBefore += sectionParts.get(child)?.list.childElementCount || 0;
+  if (total - drawnBefore > CHUNK && total > 2 * drawnBefore) drawingInPieces.add(container);
+  // a small first piece shows the page at once; bigger pieces then mean fewer layouts of the growing grid
+  let budget = drawingInPieces.has(container) ? (drawnBefore ? 4 * CHUNK : CHUNK) : Infinity;
+  let unfinished = false;
+  const existing = new Map();
+  for (const child of [...container.children]) {
+    const key = child.dataset.sectionKey;
+    if (key !== undefined && !existing.has(key)) existing.set(key, child);
+    else child.remove();
+  }
+  const wanted = new Set(sections.map((s) => s.key));
+  for (const [key, el] of existing) if (!wanted.has(key)) el.remove();
+  let cursor = container.firstElementChild;
+  for (const section of sections) {
+    let el = existing.get(section.key);
+    if (!el) {
+      el = document.createElement("section");
+      el.dataset.sectionKey = section.key;
+    }
+    if (el.className !== section.className) el.className = section.className;
+    if (el.dataset.levelSection !== String(section.level)) el.dataset.levelSection = section.level;
+    if (el.dataset.count !== String(section.rows.length)) el.dataset.count = section.rows.length;
+    if (section.id && el.id !== section.id) el.id = section.id;
+    let parts = sectionParts.get(el);
+    const listKind = section.rows.length ? "list" : "empty";
+    if (!parts || parts.kind !== listKind || (listKind === "empty" && parts.empty !== section.empty)) {
+      parts?.list.remove();
+      const list = listKind === "list" ? document.createElement(section.listTag) : document.createElement("template");
+      if (listKind === "list") {
+        list.className = section.listClass;
+      }
+      let node = list;
+      if (listKind === "empty") {
+        list.innerHTML = section.empty;
+        node = list.content.firstElementChild;
+      }
+      el.append(node);
+      parts = { ...(parts || { head: null, headNodes: [] }), kind: listKind, empty: section.empty, list: node };
+      sectionParts.set(el, parts);
+    }
+    if (parts.head !== section.head) {
+      for (const node of parts.headNodes) node.remove();
+      const template = document.createElement("template");
+      template.innerHTML = section.head;
+      parts.headNodes = [...template.content.children];
+      el.insertBefore(template.content, parts.list);
+      parts.head = section.head;
+    }
+    if (listKind === "list") {
+      const had = parts.list.childElementCount;
+      const allowed = Math.min(section.rows.length, had + budget);
+      if (allowed < section.rows.length) unfinished = true;
+      patchList(parts.list, allowed < section.rows.length ? section.rows.slice(0, allowed) : section.rows, decorate);
+      if (budget !== Infinity) budget = Math.max(0, budget - Math.max(0, allowed - had));
+    }
+    if (el === cursor) cursor = cursor.nextElementSibling;
+    else container.insertBefore(el, cursor);
+  }
+  if (unfinished) {
+    // a timer, not an animation frame: rows added off screen don't make the browser draw a new frame
+    pendingSections.set(container, setTimeout(() => {
+      pendingSections.delete(container);
+      patchSections(container, sections, decorate);
+    }, 0));
+  } else {
+    drawingInPieces.delete(container);
+  }
+}
+
+// Spells of the character by ID, and of the open book by ID (rebuilt when the lists are loaded again)
+const indexCache = new WeakMap();
+
+function indexBy(list, key) {
+  let index = indexCache.get(list);
+  if (!index) {
+    index = new Map(list.map((entry) => [key(entry), entry]));
+    indexCache.set(list, index);
+  }
+  return index;
+}
+
+function characterSpell(id, pc = state.character) {
+  return pc ? indexBy(pc.spells, (e) => e.spell.id).get(id) : undefined;
+}
+
+function bookSpell(id, book = state.book) {
+  return book ? indexBy(book.spells, (e) => e.spell.id).get(id) : undefined;
+}
+
 function breadcrumbs(entries) {
   $("#breadcrumbs").innerHTML = entries
     .map((entry, i) => (entry.href && i < entries.length - 1
@@ -295,6 +464,14 @@ async function showBook(id, view = state.view, characterId = null) {
     const character = await api(`characters/${encodeURIComponent(pid)}`);
     if (!character.spells) throw new Error(OUTDATED_SERVER);
     state.character = character;
+    forgetFullSheets();
+    if (book) {
+      // the book lists its spells, the sheets come with the character (once for both)
+      book.spells = book.spells
+        .map((entry) => ({ ...entry, spell: entry.spell || characterSpell(entry.id, character)?.spell }))
+        .filter((entry) => entry.spell)
+        .sort((a, b) => a.level - b.level || compareNames(a.spell.name, b.spell.name));
+    }
     await recoverUnsaved();
     state.book = book || allBooksCollection();
   } catch (error) {
@@ -302,6 +479,12 @@ async function showBook(id, view = state.view, characterId = null) {
     return;
   }
   renderBook();
+}
+
+function compareNames(a, b) {
+  const x = a.toLowerCase();
+  const y = b.toLowerCase();
+  return x < y ? -1 : x > y ? 1 : 0;
 }
 
 // Reloads the open page (a book or all the character's books), for example after adding a spell
@@ -338,7 +521,7 @@ function bookSummary(id) {
 
 // False when every book of the character with this spell is lost or stolen
 function spellAvailable(id) {
-  const entry = (state.character?.spells || []).find((e) => e.spell.id === id);
+  const entry = characterSpell(id);
   return entry ? entry.available !== false : true;
 }
 
@@ -359,9 +542,19 @@ function matchesFilters(spell, books = []) {
   if (state.onlyFavorites && !isFavorite(spell.id)) return false;
   const text = state.textFilter.trim().toLowerCase();
   if (!text) return true;
-  return [spell.name, school(spell), spell.school, spell.summary,
-    ...(spell.descriptors || []), ...(spell.subschools || [])]
-    .join(" ").toLowerCase().includes(text);
+  return searchText(spell).includes(text);
+}
+
+const searchTexts = new WeakMap();
+
+function searchText(spell) {
+  let text = searchTexts.get(spell);
+  if (text === undefined) {
+    text = [spell.name, school(spell), spell.school, spell.summary, ...(spell.descriptors || []), ...(spell.subschools || [])]
+      .join(" ").toLowerCase();
+    searchTexts.set(spell, text);
+  }
+  return text;
 }
 
 function filtersActive() {
@@ -389,6 +582,8 @@ function filterBar() {
           <summary>Levels</summary>
           <div class="level-menu-panel" id="level-menu-panel"></div>
         </details>
+        ${canSelect() ? `<button type="button" class="select-toggle" id="select-toggle" aria-pressed="${state.selecting}"
+          title="Pick several spells, to remove them together">${state.selecting ? "✓ Selecting" : "Select"}</button>` : ""}
       </div>
       <nav class="level-nav" id="level-nav" aria-label="Jump to level"></nav>
       ${books.length ? `<div class="book-filters" role="group" aria-label="Spellbooks">
@@ -412,8 +607,16 @@ function renderView() {
 
 function bindFilterBar() {
   const bar = $("#filter-bar");
-  $("#search").addEventListener("input", (event) => { state.textFilter = event.target.value; renderView(); });
+  let typing = null;
+  $("#search").addEventListener("input", (event) => {
+    state.textFilter = event.target.value;
+    clearTimeout(typing);
+    // with a big book, the lists are drawn again when the typing pauses
+    if (state.book.spells.length > 300) typing = setTimeout(renderView, 150);
+    else renderView();
+  });
   bar.addEventListener("click", (event) => {
+    if (event.target.closest("#select-toggle")) return setSelecting(!state.selecting);
     const chip = event.target.closest(".chip");
     if (chip) {
       const d = chip.dataset;
@@ -498,7 +701,7 @@ function updateLevelTools() {
     const n = Number(section.dataset.levelSection);
     const info = levels.get(n) || { titles: new Set(), count: 0 };
     info.titles.add(section.querySelector("h2")?.textContent.trim());
-    info.count += section.querySelectorAll(".card, .prep-row").length;
+    info.count += Number(section.dataset.count ?? section.querySelectorAll(".card, .prep-row").length);
     levels.set(n, info);
   }
   const numbers = [...levels.keys()].sort((a, b) => a - b);
@@ -571,6 +774,13 @@ function renderBook() {
       </div>
     </section>`;
 
+  // the same page drawn again (after a change, or when a download ends): its lists are kept, so only the rows
+  // that changed are redrawn and the page doesn't jump
+  const pageKey = `${book.all ? `all:${pc.id}` : book.id}|${state.view}`;
+  const kept = app.dataset.page === pageKey ? app.querySelector("[data-view-body]") : null;
+  const search = kept && document.activeElement?.id === "search" ? document.activeElement : null;
+  const scrolled = window.scrollY;
+  app.dataset.page = pageKey;
   app.innerHTML = `
     ${frontispiece}
 
@@ -588,13 +798,20 @@ function renderBook() {
     </nav>
 
     ${filterBar()}
-    <div class="parchment" id="${state.view === "prepared" ? "preparation" : state.view === "scrolls" ? "scrolls" : "book-pages"}"></div>`;
+    <div class="parchment" data-view-body id="${state.view === "prepared" ? "preparation" : state.view === "scrolls" ? "scrolls" : "book-pages"}"></div>`;
+  if (kept) app.querySelector("[data-view-body]").replaceWith(kept);
 
   $("#open-add")?.addEventListener("click", openAddDialog);
   $("#open-finder")?.addEventListener("click", openFinder);
   $("#book-settings")?.addEventListener("click", () => openBookDialog(book));
   bindFilterBar();
   renderView();
+  if (search) {
+    const field = $("#search");
+    field.focus({ preventScroll: true });
+    field.setSelectionRange(search.selectionStart, search.selectionEnd);
+  }
+  if (kept && window.scrollY !== scrolled) window.scrollTo(0, scrolled);
 }
 
 function renderPages() {
@@ -606,10 +823,17 @@ function renderPages() {
     if (!byLevel.has(entry.level)) byLevel.set(entry.level, []);
     byLevel.get(entry.level).push(entry);
   });
+  state.selectionOrder = entries.map((entry) => entry.spell.id);
+  state.selectionLevels = new Map([...byLevel].map(([level, group]) => [level, group.map((entry) => entry.spell.id)]));
+  for (const id of state.selected) if (!bookSpell(id)) state.selected.delete(id);  // removed meanwhile
+  const finish = () => {
+    updateLevelTools();
+    syncSelection();
+  };
 
   if (!book.spells.length && book.all) {
     container.innerHTML = `<div class="empty"><div class="big">No spells yet</div><p>Open one of ${esc(state.character.name)}'s spellbooks from the library and add spells to it.</p></div>`;
-    return updateLevelTools();
+    return finish();
   }
   if (!book.spells.length) {
     container.innerHTML = `
@@ -619,19 +843,21 @@ function renderPages() {
         ${book.unavailable ? "" : `<button class="button gold" type="button" data-action="add">✚ Add spell</button>`}
       </div>`;
     container.querySelector("[data-action]")?.addEventListener("click", openAddDialog);
-    return updateLevelTools();
+    return finish();
   }
   if (!entries.length) {
     container.innerHTML = `<div class="empty"><div class="big">No spells found</div><p>Try a different search, or turn off some of the filters above.</p></div>`;
-    return updateLevelTools();
+    return finish();
   }
 
-  container.innerHTML = [...byLevel.keys()].sort((a, b) => a - b).map((level) => {
+  patchSections(container, [...byLevel.keys()].sort((a, b) => a - b).map((level) => {
     const group = byLevel.get(level);
     const pageCount = group.reduce((total, v) => total + pages(v.level), 0);
     const title = levelTitle(level, book.all ? null : classByKey(book.class_key));
-    return `
-      <section class="level-section${isFolded(level) ? " folded" : ""}" id="level-${level}" data-level-section="${level}">
+    return {
+      key: `level-${level}`, level, id: `level-${level}`,
+      className: `level-section${isFolded(level) ? " folded" : ""}`,
+      head: `
         <div class="level-title">
           ${foldButton(level, title)}
           <span class="number">${level}</span>
@@ -639,11 +865,196 @@ function renderPages() {
             <h2>${esc(title)}</h2>
             <div class="level-info">${group.length} spell${group.length === 1 ? "" : "s"} · ${pageCount} page${pageCount === 1 ? "" : "s"}</div>
           </div>
-        </div>
-        <div class="spell-grid">${group.map(spellCard).join("")}</div>
-      </section>`;
-  }).join("");
-  updateLevelTools();
+          ${state.selecting ? `<label class="level-select" title="Select every spell of this level shown">
+            <input type="checkbox" data-select-level="${level}"> <span><span class="wide-only-select">Select </span>all</span></label>` : ""}
+        </div>`,
+      listTag: "div", listClass: "spell-grid",
+      rows: group.map((entry) => lazyRow(entry.spell.id, () => spellCard(entry))),
+    };
+  }), decorateCard);
+  finish();
+}
+
+// ---------- picking several spells (Spellbook tab of a book) ----------
+// "Select" in the filter bar: a click on a card picks it (shift-click: a range), the level headers get
+// "Select all", and the bar at the bottom removes the picked spells together. The picks are not part of the
+// cards' HTML (redrawing thousands of cards would be slow): decorateCard marks them on the elements.
+function canSelect() {
+  const book = state.book;
+  return state.view === "book" && Boolean(book) && !book.all && !book.unavailable && book.spells.length > 0;
+}
+
+function setSelecting(on) {
+  state.selecting = on && canSelect();
+  state.lastPicked = null;
+  if (!state.selecting) state.selected.clear();
+  const toggle = $("#select-toggle");
+  if (toggle) {
+    toggle.setAttribute("aria-pressed", String(state.selecting));
+    toggle.textContent = state.selecting ? "✓ Selecting" : "Select";
+  }
+  renderPages();  // the level headers get (or lose) their boxes
+}
+
+// leaving the page: no picks left behind
+function endSelection() {
+  state.selecting = false;
+  state.selected.clear();
+  state.lastPicked = null;
+  renderSelectBar(false);
+}
+
+function decorateCard(card) {
+  const picked = state.selecting && state.selected.has(card.dataset.id);
+  if (card.classList.contains("selected") !== picked) card.classList.toggle("selected", picked);
+  const pressed = state.selecting ? String(picked) : null;
+  if (card.getAttribute("aria-pressed") === pressed) return;
+  if (pressed === null) card.removeAttribute("aria-pressed");
+  else card.setAttribute("aria-pressed", pressed);
+}
+
+function syncSelection() {
+  const container = $("#book-pages");
+  if (state.selecting && !canSelect()) {  // e.g. the book was just marked as lost
+    state.selecting = false;
+    state.selected.clear();
+  }
+  const on = state.selecting;
+  if (container) {
+    container.classList.toggle("selecting", on);
+    if (on || container.dataset.marked) {
+      for (const card of container.querySelectorAll(".card")) decorateCard(card);
+      container.dataset.marked = on ? "1" : "";
+    }
+    for (const box of container.querySelectorAll("[data-select-level]")) {
+      const ids = state.selectionLevels.get(Number(box.dataset.selectLevel)) || [];
+      const picked = ids.filter((id) => state.selected.has(id)).length;
+      box.checked = ids.length > 0 && picked === ids.length;
+      box.indeterminate = picked > 0 && picked < ids.length;
+    }
+  }
+  renderSelectBar(on);
+}
+
+function pickCard(card, range) {
+  const id = card.dataset.id;
+  const on = !state.selected.has(id);
+  let ids = [id];
+  const order = state.selectionOrder;
+  if (range && state.lastPicked && state.lastPicked !== id) {
+    const from = order.indexOf(state.lastPicked);
+    const to = order.indexOf(id);
+    if (from >= 0 && to >= 0) ids = order.slice(Math.min(from, to), Math.max(from, to) + 1);
+  }
+  for (const picked of ids) on ? state.selected.add(picked) : state.selected.delete(picked);
+  state.lastPicked = id;
+  syncSelection();
+}
+
+const selectBar = $("#select-bar");
+
+function renderSelectBar(on) {
+  selectBar.hidden = !on;
+  if (on) {
+    if (!selectBar.firstElementChild) {
+      selectBar.innerHTML = `
+        <p class="select-info"><b id="select-count"></b> <span id="select-hidden"></span></p>
+        <div class="select-actions">
+          <button type="button" class="button compact" data-select="shown"></button>
+          <button type="button" class="button compact" data-select="none">Clear</button>
+          <button type="button" class="button compact danger" data-select="remove"></button>
+          <button type="button" class="button compact gold" data-select="done">Done</button>
+        </div>`;
+    }
+    const count = state.selected.size;
+    const shown = state.selectionOrder;
+    const shownSet = new Set(shown);
+    const hidden = [...state.selected].filter((id) => !shownSet.has(id)).length;
+    $("#select-count").textContent = count ? `${plural(count, "spell")} selected` : `${TOUCH ? "Tap" : "Click"} the spells to select`;
+    $("#select-hidden").textContent = hidden ? `(${hidden} hidden by the filters)` : "";
+    const all = selectBar.querySelector('[data-select="shown"]');
+    all.textContent = shown.length === state.book.spells.length ? "Select all" : `Select the ${shown.length} shown`;
+    all.disabled = !shown.length || shown.every((id) => state.selected.has(id));
+    selectBar.querySelector('[data-select="none"]').disabled = !count;
+    const remove = selectBar.querySelector('[data-select="remove"]');
+    remove.textContent = count ? `Remove ${count}` : "Remove";
+    remove.disabled = !count;
+  }
+  selectSpace();
+}
+
+// room kept free at the bottom for the bar: the downloads panel, messages and the top button go above it
+function selectSpace() {
+  const space = selectBar.hidden ? 0 : Math.ceil(selectBar.offsetHeight + parseFloat(getComputedStyle(selectBar).bottom) + 8);
+  document.documentElement.style.setProperty("--select-space", `${space}px`);
+  dockSpace();
+}
+new ResizeObserver(selectSpace).observe(selectBar);
+
+selectBar.addEventListener("click", (event) => {
+  const action = event.target.closest("[data-select]")?.dataset.select;
+  if (action === "shown") state.selectionOrder.forEach((id) => state.selected.add(id));
+  else if (action === "none") state.selected.clear();
+  else if (action === "remove") return removeSelected();
+  else if (action === "done") return setSelecting(false);
+  else return;
+  syncSelection();
+});
+
+app.addEventListener("change", (event) => {
+  const box = event.target.closest("[data-select-level]");
+  if (!box || !state.selecting) return;
+  for (const id of state.selectionLevels.get(Number(box.dataset.selectLevel)) || []) {
+    if (box.checked) state.selected.add(id);
+    else state.selected.delete(id);
+  }
+  syncSelection();
+});
+
+async function removeSelected() {
+  const book = state.book;
+  const ids = [...state.selected];
+  if (!ids.length) return;
+  const names = ids.map((id) => bookSpell(id)?.spell.name).filter(Boolean).sort(compareNames);
+  const list = names.length <= 6 ? names.join(", ") : `${names.slice(0, 5).join(", ")} and ${names.length - 5} more`;
+  const count = plural(ids.length, "spell");
+  const answer = await askConfirm(`Remove ${count}?`,
+    `${list} will be hidden from “${book.name}”. Their levels, prepared copies, scrolls and favorite marks are kept: restore them from the book's Settings (or add them again) to bring them back.`,
+    `Remove ${count}`, {
+      text: `Delete ${ids.length === 1 ? "it" : "them"} for good`,
+      label: `Delete ${count} for good`,
+      warning: `${list} will be deleted from “${book.name}” for good: their levels, and the prepared copies, scrolls, favorite and ★ marks they have through this book, are lost (their downloaded pages too, if no other book or spell uses them). This can't be undone.`,
+    });
+  if (!answer) return;
+  const forever = answer === "option";
+  let done;
+  try {
+    done = await api(`books/${encodeURIComponent(book.id)}/spells/remove`, { method: "POST", body: { ids, forever } });
+  } catch (error) {
+    notify(error.message === "Unknown path." ? OUTDATED_SERVER : error.message, true);
+    return;
+  }
+  endSelection();
+  await route().catch((error) => notify(error.message, true));
+  if (forever) {
+    const kept = done.count - done.sheets_deleted;
+    notify(`${plural(done.count, "spell")} deleted for good.${kept ? ` ${kept === 1 ? "One downloaded page stays" : `${kept} downloaded pages stay`}: other books or spells use ${kept === 1 ? "it" : "them"}.` : ""}`);
+  } else {
+    notify(`${plural(done.count, "spell")} removed from the book.`, false, {
+      label: "Undo",
+      run: () => restoreMany(book.id, done.ids),
+    });
+  }
+}
+
+async function restoreMany(bookId, ids) {
+  try {
+    const book = await api(`books/${encodeURIComponent(bookId)}/spells/restore`, { method: "POST", body: { ids } });
+    await route();
+    notify(`${plural(book.restored, "spell")} ${book.restored === 1 ? "is" : "are"} back in the book.`);
+  } catch (error) {
+    notify(error.message, true);
+  }
 }
 
 function spellCard(entry) {
@@ -716,16 +1127,24 @@ function viewClasses() {
 }
 
 // The spells of a class, each at its level in that class's books (the lowest if the books differ)
+const classEntryCache = new WeakMap();
+
 function classEntries(cls, pc = state.character) {
-  return (pc?.spells || []).filter((e) => e.classes?.[cls.key] !== undefined)
-    .map((e) => ({
-      ...e, level: e.classes[cls.key], books: e.books.filter((b) => b.class === cls.key),
-      available: e.available_classes ? e.available_classes.includes(cls.key) : true,
-    }));
+  const list = pc?.spells || [];
+  let byClass = classEntryCache.get(list);
+  if (!byClass) classEntryCache.set(list, byClass = new Map());
+  if (!byClass.has(cls.key)) {
+    byClass.set(cls.key, list.filter((e) => e.classes?.[cls.key] !== undefined)
+      .map((e) => ({
+        ...e, level: e.classes[cls.key], books: e.books.filter((b) => b.class === cls.key),
+        available: e.available_classes ? e.available_classes.includes(cls.key) : true,
+      })));
+  }
+  return byClass.get(cls.key);
 }
 
 function levelIn(cls, spellId) {
-  return (state.character?.spells || []).find((e) => e.spell.id === spellId)?.classes?.[cls.key];
+  return characterSpell(spellId)?.classes?.[cls.key];
 }
 
 // Classes that matter for a spell on a card or sheet: the book's class, or every class that has the spell
@@ -850,8 +1269,13 @@ function fitsSpecialization(inc, cls) {
 }
 
 // ---------- favorite spells ----------
+const favoriteSets = new WeakMap();
+
 function isFavorite(id) {
-  return (state.character?.favorites || []).includes(id);
+  const list = state.character?.favorites || [];
+  let set = favoriteSets.get(list);
+  if (!set) favoriteSets.set(list, set = new Set(list));
+  return set.has(id);
 }
 
 function toggleFavorite(id) {
@@ -948,7 +1372,7 @@ function featWarnings(feat, inc) {
   if (base === "Quicken" && /minute|hour|day|\b([2-9]|\d{2,})\s+rounds?/i.test(st.casting_time || "")) {
     warnings.push(`Quicken Spell can't be used on spells that take longer than 1 full round to cast (this one: ${st.casting_time}).`);
   }
-  if ((base === "Empower" || base === "Maximize") && !new RegExp(DICE_RE.source).test(inc.description_html || "")) {
+  if ((base === "Empower" || base === "Maximize") && !(inc.has_dice ?? new RegExp(DICE_RE.source).test(inc.description_html || ""))) {
     warnings.push(`No dice found in the description: ${base} Spell only changes variable numeric effects.`);
   }
   if (feat.sudden) warnings.push(`${feat.name} is used once per day when you cast, without preparing it in a higher slot.`);
@@ -978,8 +1402,17 @@ function metamagicProblems(entry, meta, calc, cls, pc = state.character) {
 }
 
 // ---------- prepared spells and spell slots ----------
+const preparedTotals = new WeakMap();
+
 function preparedCopies(id) {
-  return (state.character?.prepared || []).filter((p) => p.id === id).reduce((total, p) => total + p.copies, 0);
+  const list = state.character?.prepared || [];
+  let totals = preparedTotals.get(list);
+  if (!totals) {
+    totals = new Map();
+    for (const p of list) totals.set(p.id, (totals.get(p.id) || 0) + p.copies);
+    preparedTotals.set(list, totals);
+  }
+  return totals.get(id) || 0;
 }
 
 // Prepared classes: copies prepared and cast; spontaneous classes: slots used ("cast")
@@ -1027,7 +1460,7 @@ function preparedTabLabel() {
 }
 
 function visibleSpellIds() {
-  return state.book && !state.book.all ? new Set(state.book.spells.map((v) => v.spell.id)) : null;
+  return state.book && !state.book.all ? indexBy(state.book.spells, (v) => v.spell.id) : null;
 }
 
 // One row per spell at its level, plus one row for each metamagic combination
@@ -1274,20 +1707,24 @@ function renderClassBlock(block, cls) {
   const sections = levels
     .filter((l) => l.rows.length || l.slot)
     .map((l) => (spontaneous ? castingSection(l, cls) : preparationSection(l, cls)))
-    .join("");
+    .filter(Boolean);
   const filtered = filtersActive() || (!spontaneous && state.onlyPrepared);
-  block.querySelector("[data-class-sections]").innerHTML = sections
-    || `<p class="empty-level">${filtered ? "Nothing matches the filters above." : `No ${esc(cls.name)} spells ${state.book.all ? "in your books" : "in this book"} yet, and no spells per day written above.`}</p>`;
+  const container = block.querySelector("[data-class-sections]");
+  if (sections.length) patchSections(container, sections);
+  else container.innerHTML = `<p class="empty-level">${filtered ? "Nothing matches the filters above." : `No ${esc(cls.name)} spells ${state.book.all ? "in your books" : "in this book"} yet, and no spells per day written above.`}</p>`;
 }
 
+// A level of a class that prepares its spells: {head, rows} for patchSections, or null when filtered away
 function preparationSection(l, cls) {
   const rows = l.rows.filter((r) => (!state.onlyPrepared || r.copies) && matchesFilters(r.entry.spell, r.entry.books));
-  if ((state.onlyPrepared || filtersActive()) && !rows.length) return "";
-  const list = rows.length ? `<ul class="prep-list">${rows.map((r) => preparationRow(r, cls)).join("")}</ul>`
-    : `<p class="empty-level">No spells of this level in ${state.book.all ? "your books" : "this book"} yet.</p>`;
+  if ((state.onlyPrepared || filtersActive()) && !rows.length) return null;
   const title = levelTitle(l.n, cls);
-  return `
-    <section class="prep-level${isFolded(l.n) ? " folded" : ""}" data-level-section="${l.n}">
+  return {
+    key: `level-${l.n}`, level: l.n, className: `prep-level${isFolded(l.n) ? " folded" : ""}`,
+    listTag: "ul", listClass: "prep-list",
+    rows: rows.map((r) => lazyRow(r.key, () => preparationRow(r, cls))),
+    empty: `<p class="empty-level">No spells of this level in ${state.book.all ? "your books" : "this book"} yet.</p>`,
+    head: `
       <div class="level-title">
         ${foldButton(l.n, title)}
         <span class="number">${l.n}</span>
@@ -1300,21 +1737,24 @@ function preparationSection(l, cls) {
           ${l.uncastable ? `<div class="level-note error">${l.uncastable} metamagic spell${l.uncastable === 1 ? "" : "s"} can't be cast</div>` : ""}
         </div>
         <span class="counter ${levelState(l)}" title="Prepared / spells per day">${l.prepared} / ${l.slot}</span>
-      </div>
-      ${list}
-    </section>`;
+      </div>`,
+  };
 }
 
 function castingSection(l, cls) {
   const rows = l.rows.filter((r) => matchesFilters(r.entry.spell, r.entry.books));
-  if (filtersActive() && !rows.length) return "";
+  if (filtersActive() && !rows.length) return null;
   const left = Math.max(0, l.slot - l.used);
   const title = levelTitle(l.n, cls);
   const pips = Array.from({ length: l.slot }, (_, i) => `
     <button type="button" class="pip" data-used-pip="${i}" data-level="${l.n}" aria-pressed="${i < l.used}"
             aria-label="${esc(title)}, slot ${i + 1}: ${i < l.used ? "used" : "available"}"></button>`).join("");
-  return `
-    <section class="prep-level${isFolded(l.n) ? " folded" : ""}" data-level-section="${l.n}">
+  return {
+    key: `level-${l.n}`, level: l.n, className: `prep-level${isFolded(l.n) ? " folded" : ""}`,
+    listTag: "ul", listClass: "prep-list",
+    rows: rows.map((r) => lazyRow(r.entry.spell.id, () => castingRow(r, l, cls))),
+    empty: `<p class="empty-level">No spells of this level known ${state.book.all ? "in your books" : "in this book"}.</p>`,
+    head: `
       <div class="level-title">
         ${foldButton(l.n, title)}
         <span class="number">${l.n}</span>
@@ -1324,10 +1764,8 @@ function castingSection(l, cls) {
         </div>
         <span class="counter" title="Slots left / spells per day">${left} / ${l.slot}</span>
       </div>
-      ${l.slot ? `<div class="pips slot-pips" role="group" aria-label="${esc(title)} slots">${pips}</div>` : ""}
-      ${rows.length ? `<ul class="prep-list">${rows.map((r) => castingRow(r, l, cls)).join("")}</ul>`
-        : `<p class="empty-level">No spells of this level known ${state.book.all ? "in your books" : "in this book"}.</p>`}
-    </section>`;
+      ${l.slot ? `<div class="pips slot-pips" role="group" aria-label="${esc(title)} slots">${pips}</div>` : ""}`,
+  };
 }
 
 function renderDay(classes) {
@@ -1556,7 +1994,7 @@ function useSlot(cls, level, spellId, feats = "") {
   const used = Number(cls.used?.[level] || 0);
   if (used >= total) return notify(`No ${levelTitle(level, cls).toLowerCase()} slots left today.`, true);
   cls.used = { ...(cls.used || {}), [level]: used + 1 };
-  const name = state.character.spells.find((e) => e.spell.id === spellId)?.spell.name || "Spell";
+  const name = characterSpell(spellId)?.spell.name || "Spell";
   notify(`${name}${feats} cast: ${total - used - 1} level ${level} slot${total - used - 1 === 1 ? "" : "s"} left.`);
   renderPreparation();
   savePreparation();
@@ -1718,11 +2156,22 @@ function componentCosts(spell, cls) {
     }
     return costs;
   };
-  const own = read(spell.description_html);
-  const baseName = spell.inherited_from?.keys?.components;
-  const base = baseName && spell.inherited_from.chain.find((b) => b.name === baseName);
-  return !own.found && base ? read(findSpell(base.id)?.inc.description_html) : own;
+  // lists have light sheets: only the cost paragraphs (costs_html, base_costs_html); full sheets have the whole text
+  const key = cls?.tradition === "divine" ? "divine" : "arcane";
+  let cached = costCache.get(spell);
+  if (!cached) costCache.set(spell, cached = {});
+  if (!cached[key]) {
+    const own = read(spell.costs_html ?? spell.description_html);
+    const baseName = spell.inherited_from?.keys?.components;
+    const base = baseName && spell.inherited_from.chain.find((b) => b.name === baseName);
+    cached[key] = !own.found && base
+      ? read(spell.base_costs_html ?? (spell.linked?.find((c) => c.id === base.id) || findSpell(base.id)?.inc)?.description_html)
+      : own;
+  }
+  return cached[key];
 }
+
+const costCache = new WeakMap();
 
 // 12.5 -> "12 gp 5 sp", 1650 -> "1,650 gp"
 function coins(gp) {
@@ -1752,10 +2201,20 @@ function costNote(costs) {
 }
 
 // Scrolls of a spell: of one class, or of every class (card badge)
+const scrollCountCache = new WeakMap();
+
 function scrollCount(id, cls = null) {
-  return (state.character?.scrolls || [])
-    .filter((s) => s.id === id && (!cls || s.class === cls.key))
-    .reduce((total, s) => total + s.count, 0);
+  const list = state.character?.scrolls || [];
+  let counts = scrollCountCache.get(list);
+  if (!counts) {
+    counts = new Map();
+    for (const scroll of list) {
+      counts.set(`${scroll.class}|${scroll.id}`, (counts.get(`${scroll.class}|${scroll.id}`) || 0) + scroll.count);
+      counts.set(scroll.id, (counts.get(scroll.id) || 0) + scroll.count);
+    }
+    scrollCountCache.set(list, counts);
+  }
+  return counts.get(cls ? `${cls.key}|${id}` : id) || 0;
 }
 
 // Scrolls of the given classes, and what they are worth
@@ -1767,7 +2226,7 @@ function scrollTotals(classes = viewClasses()) {
     const cls = keys.get(scroll.class);
     const level = cls && levelIn(cls, scroll.id);
     if (level === undefined || !cls) continue;
-    const spell = state.character.spells.find((e) => e.spell.id === scroll.id).spell;
+    const spell = characterSpell(scroll.id).spell;
     count += scroll.count;
     value += scroll.count * scrollPrice(level, spell, cls).market;
   }
@@ -1814,7 +2273,8 @@ function scrollRow({ entry, count, price }, cls) {
     </li>`;
 }
 
-function scrollBlock(cls) {
+// The level sections of a class in the Scrolls tab, for patchSections
+function scrollSections(cls) {
   const visible = visibleSpellIds();
   const byLevel = new Map();
   for (const entry of classEntries(cls)) {
@@ -1824,13 +2284,17 @@ function scrollBlock(cls) {
     if (!byLevel.has(entry.level)) byLevel.set(entry.level, []);
     byLevel.get(entry.level).push({ entry, count, price: scrollPrice(entry.level, entry.spell, cls) });
   }
-  const sections = [...byLevel.keys()].sort((a, b) => a - b).map((level) => {
+  return [...byLevel.keys()].sort((a, b) => a - b).map((level) => {
     const rows = byLevel.get(level).sort((a, b) => favoritesFirst(a.entry.spell, b.entry.spell));
     const owned = rows.reduce((total, row) => total + row.count, 0);
     const casterLevel = scrollCasterLevel(level, cls);
     const title = levelTitle(level, cls);
-    return `
-      <section class="prep-level${isFolded(level) ? " folded" : ""}" data-level-section="${level}">
+    return {
+      key: `level-${level}`, level, className: `prep-level${isFolded(level) ? " folded" : ""}`,
+      listTag: "ul", listClass: "prep-list",
+      rows: rows.map((row) => lazyRow(row.entry.spell.id, () => scrollRow(row, cls))),
+      empty: "",
+      head: `
         <div class="level-title">
           ${foldButton(level, title)}
           <span class="number">${level}</span>
@@ -1839,16 +2303,9 @@ function scrollBlock(cls) {
             <div class="level-info">caster level ${casterLevel} · ${esc(coins((level || 0.5) * casterLevel * 25))} a scroll, plus costly components</div>
           </div>
           <span class="counter ${owned ? "full" : ""}" title="Scrolls owned">${owned}</span>
-        </div>
-        <ul class="prep-list">${rows.map((row) => scrollRow(row, cls)).join("")}</ul>
-      </section>`;
-  }).join("");
-  const filtered = state.onlyOwned || filtersActive();
-  return `
-    <section class="class-prep" id="scrolls-${esc(cls.key)}" data-class-block="${esc(cls.key)}">
-      ${classHead(cls, `${cls.tradition} scrolls`)}
-      ${sections || `<p class="empty-level">${filtered ? "Nothing matches the filters above." : `No ${esc(cls.name)} spells ${state.book.all ? "in your books" : "in this book"} yet.`}</p>`}
-    </section>`;
+        </div>`,
+    };
+  });
 }
 
 // Like the prepared spells: one block per class, one section per level, the rows of the open book (or of all the books)
@@ -1858,23 +2315,44 @@ function renderScrolls() {
   const classes = viewClasses();
   const totals = scrollTotals(classes);
   $("#scroll-count").textContent = totals.count;
-  container.innerHTML = `
-    <div class="day">
+  // the page is built once for these classes; then only the counters and the rows that changed are drawn again
+  const layout = classes.map((c) => `${c.key}:${c.type}`).join(",") + (state.book.all ? ":all" : "");
+  if (container.dataset.layout !== layout) {
+    container.dataset.layout = layout;
+    container.innerHTML = `
+      <div class="day" id="scroll-day"></div>
+      <p class="parchment-help scroll-help">Prices at the minimum caster level of each class: spell level × caster level × 25 gp
+        (a cantrip or orison counts as ½ level), plus costly material components and 5 gp for each XP the spell costs.
+        Scribing one yourself takes half the price in gold and 1/25 of it in XP, plus the full component costs.
+        ${state.book.all ? "" : "The rows are the spells of this book; the totals include the scrolls of your other books of the same class."}</p>
+      ${classJump(classes, "scrolls")}
+      ${classes.map((cls) => `
+        <section class="class-prep" id="scrolls-${esc(cls.key)}" data-class-block="${esc(cls.key)}">
+          ${classHead(cls, `${cls.tradition} scrolls`)}
+          <div data-class-sections></div>
+        </section>`).join("")
+        || `<div class="empty"><div class="big">No classes yet</div><p>Create a spellbook for this character to keep count of their scrolls.</p></div>`}`;
+  }
+  const day = `
       <div class="day-counters">
         <div class="day-counter"><span class="value">${totals.count}</span><span class="label">Scrolls</span></div>
         <div class="day-counter"><span class="value">${esc(coins(totals.value))}</span><span class="label">Market value</span></div>
       </div>
       ${classes.length ? `<div class="day-actions">
         <button class="button" type="button" id="open-cart">✚ Add scrolls</button>
-      </div>` : ""}
-    </div>
-    <p class="parchment-help scroll-help">Prices at the minimum caster level of each class: spell level × caster level × 25 gp
-      (a cantrip or orison counts as ½ level), plus costly material components and 5 gp for each XP the spell costs.
-      Scribing one yourself takes half the price in gold and 1/25 of it in XP, plus the full component costs.
-      ${state.book.all ? "" : "The rows are the spells of this book; the totals include the scrolls of your other books of the same class."}</p>
-    ${classJump(classes, "scrolls")}
-    ${classes.map(scrollBlock).join("")
-      || `<div class="empty"><div class="big">No classes yet</div><p>Create a spellbook for this character to keep count of their scrolls.</p></div>`}`;
+      </div>` : ""}`;
+  const dayBox = $("#scroll-day");
+  if (patchMemory.get(dayBox)?.html !== day) {
+    dayBox.innerHTML = day;
+    patchMemory.set(dayBox, { key: "day", html: day });
+  }
+  const filtered = state.onlyOwned || filtersActive();
+  for (const cls of classes) {
+    const box = container.querySelector(`[data-class-block="${CSS.escape(cls.key)}"] [data-class-sections]`);
+    const sections = scrollSections(cls);
+    if (sections.length) patchSections(box, sections);
+    else box.innerHTML = `<p class="empty-level">${filtered ? "Nothing matches the filters above." : `No ${esc(cls.name)} spells ${state.book.all ? "in your books" : "in this book"} yet.`}</p>`;
+  }
   updateLevelTools();
 }
 
@@ -2583,16 +3061,59 @@ function formatDescription(html) {
   return { html: output.innerHTML, notes };
 }
 
-// A sheet of the book, or a spell referenced by a sheet (in "linked", already completed by the server)
+// A spell of the page (light sheet), or a spell referenced by an opened sheet (in "linked", already completed)
 function findSpell(id) {
-  const entry = state.book?.spells.find((v) => v.spell.id === id);
+  const entry = bookSpell(id);
   if (entry) return { entry, inc: entry.spell };
-  const sheets = [...(state.book?.spells || []).map((v) => v.spell), state.preview?.spell].filter(Boolean);
+  const sheets = [...fullSheetData.values(), state.preview?.spell].filter(Boolean);
   for (const sheet of sheets) {
     const linked = sheet.linked?.find((c) => c.id === id);
     if (linked) return { entry: null, inc: linked };
   }
   return null;
+}
+
+// Full sheets (description, levels, referenced spells), fetched when a sheet is opened; emptied when the page reloads
+const fullSheets = new Map();     // id -> promise
+const fullSheetData = new Map();  // id -> sheet
+
+function forgetFullSheets() {
+  fullSheets.clear();
+  fullSheetData.clear();
+}
+
+function fullSheet(id) {
+  if (!fullSheets.has(id)) {
+    fullSheets.set(id, api(`spells/${encodeURIComponent(id)}`).then((sheet) => {
+      fullSheetData.set(id, sheet);
+      return sheet;
+    }, (error) => {
+      fullSheets.delete(id);
+      throw error;
+    }));
+  }
+  return fullSheets.get(id);
+}
+
+let sheetRequest = null;
+
+async function openSheet(id, options = {}) {
+  const found = findSpell(id);
+  if (!found) return;
+  if (!found.entry || fullSheetData.has(id)) return showSheet(id, options);
+  sheetRequest = id;
+  const dialog = $("#sheet-dialog");
+  if (!dialog.open) {
+    $("#sheet").innerHTML = `<article class="parchment sheet"><p class="loading">Opening ${esc(found.inc.name)}…</p></article>`;
+    dialog.showModal();
+  }
+  try {
+    await fullSheet(id);
+  } catch (error) {
+    notify(error.message, true);
+    return;
+  }
+  if (sheetRequest === id) showSheet(id, options);
 }
 
 // "Forbidden school for your Wizard" on the sheet, for the classes of the page that forbid the spell's school
@@ -2608,10 +3129,11 @@ function inheritedNote(inc, key) {
   return name ? ` <small class="inherited">from ${esc(name)}</small>` : "";
 }
 
-function openSheet(id, { from = null } = {}) {
+function showSheet(id, { from = null } = {}) {
   const found = findSpell(id);
   if (!found) return;
-  const { entry, inc } = found;
+  const { entry } = found;
+  const inc = (entry && fullSheetData.get(id)) || found.inc;
   const st = inc.stats || {};
   const bookClass = (state.book.all ? (state.character?.classes || []).map((c) => c.name).join(",") : state.book.caster_class || "").toLowerCase();
   const all = Boolean(state.book.all);
@@ -2629,7 +3151,7 @@ function openSheet(id, { from = null } = {}) {
   const description = formatDescription(inc.description_html || `<p>${esc(inc.summary)}</p>`);
   // "functions like X": the text of X (and of its own base, if any) below the description
   const bases = (inc.inherited_from?.chain || []).map(({ id: idBase, name }) => {
-    const base = findSpell(idBase)?.inc;
+    const base = inc.linked?.find((c) => c.id === idBase) || findSpell(idBase)?.inc;
     return { id: idBase, name, text: base ? formatDescription(base.description_html || `<p>${esc(base.summary)}</p>`) : null };
   });
   const baseNotes = inc.inherited_from?.keys?.components
@@ -2875,7 +3397,7 @@ async function confirmAdd() {
   if (state.preview.urls) {
     try {
       const done = await importSpells(state.preview.urls, $("#preview"));
-      notify(`${(done.added || []).length} spells added to the book.`);
+      if (done.shown) notify(`${plural((done.added || []).length, "spell")} added to “${done.book_name}”.`);
       state.preview = null;
     } catch (error) {
       $("#add-error").textContent = error.message;
@@ -2899,17 +3421,367 @@ async function confirmAdd() {
 }
 
 // ---------- background work: dndtools searches and imports ----------
-async function followJob(id, onProgress) {
-  for (;;) {
-    const job = await api(`jobs/${encodeURIComponent(id)}`);
-    if (job.finished) {
-      if (job.error) throw new Error(job.error);
-      return job;
+// Searches and imports run on the server. The job panel (#job-dock) lists them (GET /api/jobs) with their progress
+// whatever page or dialog is open, and after a reload too; a finished one stays, with its result, until it is closed.
+const DISMISSED_KEY = "grimoire-dismissed-jobs";
+const jobs = {
+  list: new Map(),      // id -> summary from GET /api/jobs
+  watchers: new Map(),  // id -> {resolve, reject, onProgress, box}: a dialog waiting for the result
+  timer: null, polling: false, again: false, failures: 0,
+  round: 0,  // job lists asked so far
+  listed: false,  // a first list arrived: jobs missing from it and finished in a later one have just ended
+  seenRunning: new Set(),  // jobs this page saw running: listed when they end, however long ago they started
+  minimized: (() => { try { return localStorage.getItem("grimoire-jobs-minimized") === "1"; } catch { return false; } })(),
+  dismissed: (() => { try { return new Set(JSON.parse(localStorage.getItem(DISMISSED_KEY)) || []); } catch { return new Set(); } })(),
+};
+
+function dismissJob(id) {
+  if (id) jobs.dismissed.add(id);
+  try { localStorage.setItem(DISMISSED_KEY, JSON.stringify([...jobs.dismissed].slice(-60))); } catch { /* storage blocked */ }
+  renderDock();
+}
+
+// true when the element is on screen (not in a closed dialog)
+function onScreen(element) {
+  return Boolean(element?.isConnected && element.getClientRects().length);
+}
+
+// Follows a job started by this page: onProgress(summary) while it runs; resolves with the whole job when it ends
+// (`shown`: its result was on screen in `box`, so the panel doesn't list it), rejects if it failed.
+function watchJob(job, { box = null, onProgress = () => {} } = {}) {
+  jobs.list.set(job.id, { ...job, counts: {} });
+  jobs.seenRunning.add(job.id);
+  // round: a list asked before this job existed doesn't have it yet, so only a later one can say it is gone
+  const done = new Promise((resolve, reject) => jobs.watchers.set(job.id, { resolve, reject, onProgress, box, round: jobs.round }));
+  pollJobs();
+  return done;
+}
+
+function pollJobs(delay = 0) {
+  clearTimeout(jobs.timer);
+  jobs.timer = setTimeout(checkJobs, delay);
+}
+
+async function checkJobs() {
+  if (jobs.polling) {
+    jobs.again = true;
+    return;
+  }
+  jobs.polling = true;
+  const round = ++jobs.round;
+  let list = null;
+  try {
+    list = await api("jobs");
+    jobs.failures = 0;
+  } catch {
+    jobs.failures += 1;
+  }
+  if (list) {
+    const now = new Map(list.map((job) => [job.id, job]));
+    for (const [id, watcher] of jobs.watchers) {
+      if (now.has(id)) continue;
+      if (watcher.round < round) {  // the server was restarted: the job is gone
+        jobs.watchers.delete(id);
+        watcher.reject(new Error("This search or import stopped: the server was restarted."));
+      } else if (jobs.list.has(id)) {
+        now.set(id, jobs.list.get(id));
+      }
     }
-    onProgress(job);
-    await new Promise((resolve) => setTimeout(resolve, 600));
+    const endings = [];
+    for (const job of list) {
+      const before = jobs.list.get(job.id);
+      const watcher = jobs.watchers.get(job.id);
+      if (!job.finished) watcher?.onProgress(job);
+      // (a quick job started on another device can start and end between two lists)
+      else if (watcher || (before ? !before.finished : jobs.listed)) endings.push(job);
+    }
+    jobs.list = now;
+    for (const job of list) if (!job.finished) jobs.seenRunning.add(job.id);
+    jobs.listed = true;
+    await Promise.all(endings.map(jobEnded));
+  }
+  renderDock();
+  jobs.polling = false;
+  const running = [...jobs.list.values()].some((job) => !job.finished) || jobs.watchers.size;
+  // quick while something runs; otherwise now and then, for jobs started on another device
+  const delay = running ? (jobs.failures ? 2000 : 700) : 8000;
+  if (jobs.again) {
+    jobs.again = false;
+    pollJobs();
+  } else if (running || !document.hidden) {
+    pollJobs(delay);
   }
 }
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) pollJobs();
+});
+
+async function jobEnded(summary) {
+  const watcher = jobs.watchers.get(summary.id);
+  jobs.watchers.delete(summary.id);
+  let job = summary;
+  if (watcher) {
+    try {
+      job = await api(`jobs/${encodeURIComponent(summary.id)}`);
+    } catch (error) {
+      watcher.reject(error);
+      return;
+    }
+  }
+  const shown = onScreen(watcher?.box);
+  if (shown) {
+    jobs.dismissed.add(job.id);  // its result is in the open dialog
+  } else {
+    const action = jobAction(summary);
+    notify(`${jobTitle(summary)}: ${jobResult(summary)}`, Boolean(summary.error), action && { label: action.label, run: action.run });
+    if (!watcher) await refreshAfterJob(summary);
+  }
+  if (!watcher) return;
+  if (job.error) watcher.reject(new Error(job.error));
+  else watcher.resolve({ ...job, shown });
+}
+
+// After an import, the page is reloaded if it shows that book, its character or the library
+async function refreshAfterJob(job) {
+  if (job.kind !== "import" || !job.added && !job.counts?.added) return;
+  const [, page, id] = location.hash.split("/");
+  const shown = page === "book" ? decodeURIComponent(id || "") === job.book
+    : page === "character" ? decodeURIComponent(id || "") === job.character : true;
+  if (shown) await route().catch((error) => notify(error.message, true));
+}
+
+function searchDescription(filters = {}) {
+  const pretty = (slug) => String(slug).split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+  const parts = [];
+  if (filters.class_levels__slug) parts.push(`${pretty(filters.class_levels__slug)} ${(filters.spellclasslevel__level || []).join(", ")}`.trim());
+  if (filters.domain_levels__slug) parts.push(`${pretty(filters.domain_levels__slug)} domain ${(filters.spelldomainlevel__level || []).join(", ")}`.trim());
+  if (filters.school__slug) parts.push(pretty(filters.school__slug));
+  if (filters.name) parts.push(`“${filters.name}”`);
+  return parts.join(" · ");
+}
+
+function jobTitle(job) {
+  const book = `“${job.book_name || "the book"}”`;
+  if (job.kind === "import") {
+    if (!job.finished) return job.cancelled ? `Stopping: adding to ${book}` : `Adding spells to ${book}`;
+    return job.error ? `Adding to ${book} failed` : job.cancelled ? `Stopped adding to ${book}` : `Finished adding to ${book}`;
+  }
+  if (!job.finished) return job.cancelled ? "Stopping the dndtools search" : "Searching dndtools";
+  return job.error ? "dndtools search failed" : job.stopped || job.cancelled ? "dndtools search stopped" : "dndtools search finished";
+}
+
+
+// "about 2 min left", from the pace so far (the server's estimate)
+function timeLeft(job) {
+  if (job.finished || job.cancelled || !job.total) return "";
+  const s = job.remaining;
+  if (s === null || s === undefined) return "working out the time left…";
+  if (s < 10) return "a few seconds left";
+  if (s < 60) return `about ${Math.max(10, Math.round(s / 5) * 5)} s left`;
+  if (s < 600) {
+    let minutes = Math.floor(s / 60);
+    let seconds = Math.round((s % 60) / 10) * 10;
+    if (seconds === 60) [minutes, seconds] = [minutes + 1, 0];
+    return `about ${minutes} min${seconds ? ` ${seconds} s` : ""} left`;
+  }
+  if (s < 3600) return `about ${Math.round(s / 60)} min left`;
+  const minutes = Math.round((s % 3600) / 60);
+  return `about ${Math.floor(s / 3600)} h${minutes ? ` ${minutes} min` : ""} left`;
+}
+
+function jobResult(job) {
+  const counts = job.counts || {};
+  if (!job.finished) {
+    if (!job.total) return "Starting…";
+    const left = timeLeft(job);
+    return `${job.done} of ${job.total} ${job.kind === "import" ? "spells" : "pages"}${left ? ` · ${left}` : ""}`;
+  }
+  if (job.error) return job.error;
+  if (job.kind === "import") {
+    return [`${plural(counts.added || 0, "spell")} added`, counts.skipped && `${counts.skipped} already there`,
+      counts.failed && `${counts.failed} not added`].filter(Boolean).join(", ") + ".";
+  }
+  return `${plural(counts.results || 0, "spell")} found${job.incomplete ? " (some pages could not be loaded)" : ""}.`;
+}
+
+// "Open book" for an import, "Show results" for a search: null when there is nothing to open from here
+function jobAction(job) {
+  if (!job.finished || job.error) return null;
+  if (job.kind === "import") {
+    if (!job.book || location.hash === `#/book/${encodeURIComponent(job.book)}`) return null;
+    return { label: "Open book", run: () => { location.hash = `#/book/${encodeURIComponent(job.book)}`; } };
+  }
+  // the results are added to the open book, so they are shown on a book page
+  if (!/^#\/book\//.test(location.hash) || !state.book?.id || state.book.unavailable) return null;
+  return { label: "Show results", run: () => showSearchResults(job.id) };
+}
+
+async function showSearchResults(id) {
+  if (finder.jobId === id) return openFinder();
+  let job;
+  try {
+    job = await api(`jobs/${encodeURIComponent(id)}`);
+  } catch (error) {
+    notify(error.message, true);
+    return;
+  }
+  await openFinder();
+  if (!finder.options || finder.busy) return;
+  applySearch(job, job.filters || {});
+  finder.summary = "";
+  renderFinderResults();
+}
+
+// ---- the panel ----
+const dock = $("#job-dock");
+
+// jobs that ended long before the page was opened are old news: only the recent ones are listed
+const PAGE_OPENED = Date.now();
+const RECENT = 10 * 60 * 1000;
+
+function dockJobs() {
+  return [...jobs.list.values()]
+    .filter((job) => !jobs.dismissed.has(job.id) && !onScreen(jobs.watchers.get(job.id)?.box))
+    .filter((job) => !job.finished || jobs.seenRunning.has(job.id) || PAGE_OPENED - Date.parse(job.finished_at) < RECENT)
+    .sort((a, b) => (a.finished - b.finished) || String(b.started_at).localeCompare(String(a.started_at)))
+    .slice(0, 3);
+}
+
+function renderDock() {
+  const shown = dockJobs();
+  dock.hidden = !shown.length;
+  if (!shown.length) {
+    dockSpace();
+    return;
+  }
+  const running = shown.filter((job) => !job.finished);
+  if (!dock.firstElementChild) {
+    dock.innerHTML = `<div class="dock-head"><button type="button" class="dock-toggle"></button>
+      <button type="button" class="dock-clear" data-clear-jobs>Clear</button></div><div class="dock-list"></div>`;
+  }
+  const toggle = dock.querySelector(".dock-toggle");
+  const done = running.reduce((sum, job) => sum + job.done, 0);
+  const total = running.reduce((sum, job) => sum + job.total, 0);
+  toggle.textContent = running.length
+    ? `${jobs.minimized ? "⟳ " : ""}${running.length} running${total ? ` · ${Math.floor((done / total) * 100)}%` : ""}`
+    : `${plural(shown.length, "download")} finished`;
+  toggle.setAttribute("aria-expanded", String(!jobs.minimized));
+  toggle.title = jobs.minimized ? "Show the downloads" : "Hide the downloads";
+  dock.classList.toggle("minimized", jobs.minimized);
+  const clear = dock.querySelector("[data-clear-jobs]");
+  clear.hidden = jobs.minimized || shown.length - running.length < 2;
+  clear.title = "Close the finished downloads";
+  const list = dock.querySelector(".dock-list");
+  const cards = new Map([...list.children].map((card) => [card.dataset.job, card]));
+  shown.forEach((job, index) => {
+    const card = cards.get(job.id) || jobCard(job);
+    cards.delete(job.id);
+    updateJobCard(card, job);
+    if (list.children[index] !== card) list.insertBefore(card, list.children[index] || null);
+  });
+  for (const card of cards.values()) card.remove();
+  dockSpace();
+}
+
+function jobCard(job) {
+  const card = document.createElement("div");
+  card.className = "job-card";
+  card.dataset.job = job.id;
+  card.innerHTML = `
+    <div class="job-card-head"><b class="job-title"></b>
+      <button type="button" class="button compact" data-stop-job="${esc(job.id)}">Stop</button>
+      <button type="button" class="button compact" data-job-action="${esc(job.id)}"></button>
+      <button type="button" class="job-dismiss" data-dismiss-job="${esc(job.id)}" aria-label="Close" title="Close">×</button></div>
+    <p class="job-detail"></p>
+    <div class="page-bar"><span></span></div>
+    <p class="job-text" role="status"></p>`;
+  return card;
+}
+
+function updateJobCard(card, job) {
+  const failed = Boolean(job.error) || (job.finished && job.counts?.failed > 0);
+  card.classList.toggle("done", job.finished && !failed);
+  card.classList.toggle("failed", failed);
+  card.querySelector(".job-title").textContent = jobTitle(job);
+  const detail = job.kind === "search" ? searchDescription(job.filters) : "";
+  card.querySelector(".job-detail").textContent = detail;
+  card.querySelector(".job-detail").hidden = !detail;
+  const bar = card.querySelector(".page-bar");
+  bar.hidden = job.finished;
+  bar.firstElementChild.style.width = `${job.total ? Math.round((job.done / job.total) * 100) : 0}%`;
+  card.querySelector(".job-text").textContent = jobResult(job);
+  const stop = card.querySelector("[data-stop-job]");
+  stop.hidden = job.finished;
+  if (job.cancelled && !stop.disabled) {
+    stop.disabled = true;
+    stop.textContent = "Stopping…";
+  }
+  card.querySelector("[data-dismiss-job]").hidden = !job.finished;
+  const action = jobAction(job);
+  const button = card.querySelector("[data-job-action]");
+  button.hidden = !action;
+  if (action) button.textContent = action.label;
+}
+
+// Room kept free for the panel: messages and the "top" button go above it, dialogs end above it
+function dockSpace() {
+  // height + distance from the bottom edge (not the position on screen: it moves while the panel slides in)
+  const space = dock.hidden ? 0 : Math.ceil(dock.offsetHeight + parseFloat(getComputedStyle(dock).bottom) + 6);
+  document.documentElement.style.setProperty("--dock-space", `${Math.max(0, space)}px`);
+}
+window.addEventListener("resize", dockSpace);
+new ResizeObserver(dockSpace).observe(dock);
+
+dock.addEventListener("click", (event) => {
+  if (event.target.closest(".dock-toggle")) {
+    jobs.minimized = !jobs.minimized;
+    try { localStorage.setItem("grimoire-jobs-minimized", jobs.minimized ? "1" : "0"); } catch { /* storage blocked */ }
+    renderDock();
+    return;
+  }
+  const dismiss = event.target.closest("[data-dismiss-job]");
+  if (dismiss) return dismissJob(dismiss.dataset.dismissJob);
+  if (event.target.closest("[data-clear-jobs]")) {
+    for (const job of dockJobs()) if (job.finished) jobs.dismissed.add(job.id);
+    return dismissJob(null);
+  }
+  const button = event.target.closest("[data-job-action]");
+  const job = button && jobs.list.get(button.dataset.jobAction);
+  const action = job && jobAction(job);
+  if (!action) return;
+  dismissJob(job.id);  // it has been looked at
+  action.run();
+});
+window.addEventListener("hashchange", () => renderDock());
+
+// A modal dialog makes the rest of the page unreachable: the panel and the messages move into the open dialog
+// (the last one opened), and back to the page when it closes.
+const openDialogs = [];
+function placeOverlays() {
+  const host = openDialogs.at(-1) || document.body;
+  if (dock.parentElement !== host) {
+    host.append(dock);
+    dock.classList.add("moved");  // no slide-in again: it was already on screen
+  }
+  if ($("#toasts").parentElement !== host) host.append($("#toasts"));
+  renderDock();  // a closed dialog may have been showing a job's progress
+}
+new MutationObserver((records) => {
+  for (const { target } of records) {
+    if (target.tagName !== "DIALOG") continue;
+    const index = openDialogs.indexOf(target);
+    if (index >= 0) openDialogs.splice(index, 1);
+    if (target.open && target.matches(":modal")) openDialogs.push(target);
+  }
+  // while a dialog is still sliding in, fixed children would move with it: wait until it stands still
+  // (its style is computed first: the opening animation doesn't exist before that)
+  const host = openDialogs.at(-1);
+  if (host) getComputedStyle(host).animationName;
+  const moving = host?.getAnimations?.() || [];
+  if (moving.length) Promise.all(moving.map((a) => a.finished.catch(() => {}))).then(placeOverlays);
+  else placeOverlays();
+}).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["open"] });
 
 // Progress of a search or an import in `box`, with "Stop"; the box is built once, then only text and bar change
 // (so a click on "Stop" is never lost to a redraw)
@@ -2950,9 +3822,9 @@ function importSummary(job, names = new Map()) {
   const restored = added.filter((a) => a.restored).length;
   return `
     <div class="import-summary" role="status">
-      <p><b>${added.length} spell${added.length === 1 ? "" : "s"} added</b>${restored ? ` (${restored} removed earlier and now back)` : ""} to “${esc(state.book.name)}”${
+      <p><b>${added.length} spell${added.length === 1 ? "" : "s"} added</b>${restored ? ` (${restored} removed earlier and now back)` : ""} to “${esc(job.book_name || state.book.name)}”${
         skipped.length ? `, ${skipped.length} already there` : ""}${failed.length ? `, ${failed.length} not added` : ""}.</p>
-      ${guessed.length ? `<p>No ${esc(state.book.caster_class || "Wizard")} level for ${guessed.map((a) => `${esc(a.name)} (${
+      ${guessed.length ? `<p>No ${esc(job.caster_class || state.book.caster_class || "Wizard")} level for ${guessed.map((a) => `${esc(a.name)} (${
         a.source && a.source !== "lowest" ? `${esc(a.source)} level` : "lowest level"} ${a.level})`).join(", ")}: check them on the spell sheet.</p>` : ""}
       ${job.cancelled ? `<p>Stopped: the spells that were still to download were not added.</p>` : ""}
       ${failed.length ? `<ul class="import-failed">${failed.map((f) => `<li>${esc(names.get(f.id) || f.url)}: ${esc(f.error)}</li>`).join("")}</ul>` : ""}
@@ -2965,10 +3837,11 @@ async function importSpells(urls, box, names = new Map()) {
   showProgress(box, "Adding spells…", 0, urls.length);
   const job = await api(`books/${encodeURIComponent(state.book.id)}/import`, { method: "POST", body: { urls } });
   showProgress(box, "Adding spells…", 0, urls.length, job.id);
-  const done = await followJob(job.id, (j) => {
-    showProgress(box, j.cancelled ? `Stopping… ${j.done} of ${j.total}` : `Adding spells… ${j.done} of ${j.total}`, j.done, j.total);
-  });
-  await reloadView();
+  const done = await watchJob(job, { box, onProgress: (j) => {
+    const left = timeLeft(j);
+    showProgress(box, j.cancelled ? `Stopping… ${j.done} of ${j.total}` : `Adding spells… ${j.done} of ${j.total}${left ? ` · ${left}` : ""}`, j.done, j.total);
+  } });
+  await refreshAfterJob(done);
   box.innerHTML = importSummary(done, names);
   return done;
 }
@@ -2983,6 +3856,7 @@ const FINDER_TEXTS = [["casting_time", "Casting time"], ["range", "Range"], ["ar
 const FINDER_MULTI = ["spellclasslevel__level", "spelldomainlevel__level", "rulebook__dnd_edition__slug"];
 const finder = {
   options: null, results: [], selected: new Set(), searched: false, stopped: false, incomplete: false, busy: false, summary: "",
+  jobId: null,
 };
 
 async function openFinder() {
@@ -3102,15 +3976,11 @@ async function runFinder(event) {
   try {
     const job = await api("dndtools/search", { method: "POST", body: { filters } });
     showProgress(out, "Searching dndtools…", 0, 0, job.id);
-    const done = await followJob(job.id, (j) => {
-      showProgress(out, `${j.cancelled ? "Stopping" : "Searching dndtools"}… ${j.done} of ${j.total} pages`, j.done, j.total);
-    });
-    Object.assign(finder, {
-      results: done.results, searched: true, stopped: done.stopped, incomplete: done.incomplete,
-      className: optionLabel("class_levels__slug", filters.class_levels__slug),
-      domainName: optionLabel("domain_levels__slug", filters.domain_levels__slug),
-    });
-    finder.selected.clear();
+    const done = await watchJob(job, { box: out, onProgress: (j) => {
+      const left = timeLeft(j);
+      showProgress(out, `${j.cancelled ? "Stopping" : "Searching dndtools"}… ${j.done} of ${j.total} pages${left ? ` · ${left}` : ""}`, j.done, j.total);
+    } });
+    applySearch(done, filters);
   } catch (error) {
     out.innerHTML = `<p class="form-error">${esc(error.message === "Unknown path." ? OUTDATED_SERVER : error.message)}</p>`;
     return;
@@ -3120,6 +3990,15 @@ async function runFinder(event) {
   }
   renderFinderResults();
   out.scrollIntoView({ block: "start", behavior: "smooth" });
+}
+
+function applySearch(job, filters) {
+  Object.assign(finder, {
+    jobId: job.id, results: job.results || [], searched: true, stopped: job.stopped, incomplete: job.incomplete,
+    className: optionLabel("class_levels__slug", filters.class_levels__slug),
+    domainName: optionLabel("domain_levels__slug", filters.domain_levels__slug),
+  });
+  finder.selected.clear();
 }
 
 function finderInBook() {
@@ -3193,7 +4072,7 @@ async function importFinderSelection() {
     const done = await importSpells(urls, box, new Map(finder.results.map((r) => [r.id, r.name])));
     finder.summary = box.innerHTML;
     finder.selected.clear();
-    notify(`${(done.added || []).length} spells added to “${state.book.name}”.`);
+    if (done.shown) notify(`${plural((done.added || []).length, "spell")} added to “${done.book_name}”.`);
   } catch (error) {
     finder.summary = `<p class="form-error">${esc(error.message)}</p>`;
   } finally {
@@ -3616,6 +4495,8 @@ async function deleteBook() {
 function route() {
   const [, page, id, section] = location.hash.split("/");
   const view = ["prepared", "scrolls"].includes(section) ? section : "book";
+  const samePage = page === "book" && view === "book" && state.view === "book" && state.book?.id === decodeURIComponent(id || "");
+  if (state.selecting && !samePage) endSelection();
   if (page === "book" && id) return showBook(decodeURIComponent(id), view);
   if (page === "character" && id) return showBook(null, view, decodeURIComponent(id));
   return showLibrary();
@@ -3627,6 +4508,11 @@ window.addEventListener("hashchange", () => {
 });
 
 app.addEventListener("click", (event) => {
+  const picked = state.selecting && event.target.closest("#book-pages .card");
+  if (picked) {
+    event.preventDefault();
+    return pickCard(picked, event.shiftKey);
+  }
   const base = event.target.closest("[data-ref-card]");
   if (base) return openSheet(base.dataset.refCard, { from: base.dataset.from });
   const card = event.target.closest(".card");
@@ -3669,6 +4555,10 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && menu) {
     menu.open = false;
     menu.querySelector("summary").focus();
+    return;
+  }
+  if (event.key === "Escape" && state.selecting && !document.querySelector("dialog[open]")) {
+    setSelecting(false);
     return;
   }
   const typing = /INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName);
@@ -3798,7 +4688,7 @@ $("#metamagic").addEventListener("change", (event) => {
     else chosen.delete(apply);
   }
   if (heighten) {
-    const entry = state.character.spells.find((v) => v.spell.id === state.metamagic.id);
+    const entry = characterSpell(state.metamagic.id);
     chosen.set(heighten, Number(event.target.value) - entry.level);
   }
   if (increase) {
@@ -3829,7 +4719,8 @@ $("#metamagic").addEventListener("input", (event) => {
 
 loadConditions();
 loadMetamagic();
+pollJobs();
 
 route().catch((error) => {
-  app.innerHTML = `<div class="empty dark"><div class="big">The grimoire isn't responding</div><p>${esc(error.message)}</p><p>Is the server running? Start it with <code>python3 server.py</code> in the spellbook folder.</p></div>`;
+  app.innerHTML = `<div class="empty dark"><div class="big">The grimoire isn't responding</div><p>${esc(error.message)}</p><p>Is the server running? Start it with the start script in the grimoire folder.</p></div>`;
 });
