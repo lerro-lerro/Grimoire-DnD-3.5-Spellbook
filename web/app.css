@@ -140,6 +140,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
   cursor: pointer;
   transition: background .15s, border-color .15s, transform .15s;
   white-space: nowrap;
+  text-decoration: none; /* "dndtools ↗" is a link */
 }
 .button:hover { background: rgba(232, 207, 138, .12); border-color: var(--gold); }
 .button:active { transform: translateY(1px); }
@@ -640,7 +641,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 
 .spell-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr));
   gap: 1rem;
 }
 /* thousands of spells: the rows come in blocks of 24 (patchList), and in a big list only the blocks near the
@@ -884,6 +885,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 /* full spell sheet */
 .sheet-dialog { width: min(1040px, calc(100vw - 2rem)); background: transparent; border: 0; box-shadow: none; overflow: visible; }
 .sheet-dialog .parchment { max-height: calc(100vh - 3rem); max-height: calc(100dvh - 3rem); overflow: auto; overscroll-behavior: contain; }
+/* the top bar: on a computer only the ×; on a phone a bar that stays on screen (see the 700px rules) */
+.sheet-top { display: contents; }
+.sheet-top-name { display: none; }
 .sheet-close {
   position: absolute;
   top: .7rem;
@@ -905,7 +909,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .sheet .source { color: var(--ink-faint); font-size: .95rem; margin-top: .15rem; }
 .sheet .class-levels { margin: .8rem 0 0; font-size: .95rem; }
 .sheet .class-levels b { color: var(--ink); }
-.sheet .class-levels .current { background: rgba(201, 162, 74, .35); border-radius: 4px; padding: 0 .25rem; }
+.sheet .class-levels .current { white-space: nowrap; border-radius: 3px; background: rgba(201, 162, 74, .35); box-shadow: 0 0 0 .18em rgba(201, 162, 74, .35); } /* no padding: it would space the comma */
 /* sheet body: stats on the side, text at a comfortable reading width */
 .sheet-body {
   display: grid;
@@ -1833,12 +1837,14 @@ button.row-star[aria-pressed="true"] { color: #fff8e6; background: var(--gold-da
   .chip { flex: none; }
   .level-section { scroll-margin-top: 4.5rem; }
   .parchment { padding: 1rem .8rem; }
-  .spell-grid { grid-template-columns: 1fr; gap: .8rem; }
+  .spell-grid { grid-template-columns: minmax(0, 1fr); gap: .8rem; } /* 1fr would grow to the card's longest line */
   .spell-grid-blocks { gap: .8rem; }
   .level-title { gap: .7rem; }
   .level-title .number { width: 2.3rem; height: 2.3rem; font-size: 1.05rem; }
   .level-title h2 { font-size: 1.15rem; }
   .card-footer { flex-wrap: wrap; }
+  /* a long value on two lines instead of cut: "Will negates (harmless) (DC 16) · No" */
+  .quick-stats dd { white-space: normal; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
 
   /* prepared spells */
   .book-tabs a { flex: 1; justify-content: center; padding: .6rem .4rem; font-size: .82rem; }
@@ -1889,7 +1895,37 @@ button.row-star[aria-pressed="true"] { color: #fff8e6; background: var(--gold-da
   /* full-screen spell sheet */
   .sheet-dialog { width: 100vw; max-width: 100vw; height: 100dvh; max-height: 100dvh; margin: 0; }
   .sheet-dialog .parchment { height: 100dvh; max-height: 100dvh; border-radius: 0; padding: 1.1rem 1rem calc(1.5rem + env(safe-area-inset-bottom)); }
-  .sheet-close {
+  /* a bar that stays at the top: the × (the text scrolls under the bar, never under a floating button), and the
+     spell's name once the title has scrolled away (.scrolled, markSheetScrolled). It overlaps the title's line,
+     so the title starts where it always did. */
+  .sheet-top {
+    position: sticky;
+    top: -1.1rem; /* the parchment's top padding: the bar reaches the top edge */
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    gap: .6rem;
+    height: 3.5rem;
+    margin: -1.1rem -1rem -2.4rem;
+    padding: 0 .5rem 0 1rem;
+    pointer-events: none; /* only the × takes clicks while the bar is see-through */
+    transition: background-color .2s, box-shadow .2s;
+  }
+  .sheet-top-name {
+    display: block;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--title-font);
+    font-size: 1.05rem;
+    font-weight: 700;
+    opacity: 0;
+    transition: opacity .2s;
+  }
+  .sheet-top .sheet-close { position: static; flex: none; margin-left: auto; pointer-events: auto; }
+  .condition-sheet > .sheet-close {
     position: sticky;
     top: 0;
     float: right;
@@ -1898,25 +1934,32 @@ button.row-star[aria-pressed="true"] { color: #fff8e6; background: var(--gold-da
     background: var(--parchment-2);
     box-shadow: 0 2px 8px rgba(90, 60, 25, .25);
   }
-  .sheet h2 { margin-right: 0; font-size: 1.45rem; }
-  .sheet .class-levels { font-size: .88rem; }
-  /* compact stats: label and value on the same line */
+  .sheet.scrolled .sheet-top {
+    pointer-events: auto;
+    background-color: #f6efde; /* the top of the parchment */
+    box-shadow: 0 1px 0 rgba(107, 88, 66, .25), 0 6px 14px -6px rgba(90, 60, 25, .35);
+  }
+  .sheet.scrolled .sheet-top-name { opacity: 1; }
+  .sheet h2 { margin-right: 3rem; font-size: 1.45rem; }
+  .sheet .class-levels { font-size: .88rem; line-height: 1.55; }
+  /* compact stats: label and value on the same line, one line under both */
   .stats-table {
     display: grid;
-    grid-template-columns: minmax(5.5rem, max-content) 1fr;
-    column-gap: .9rem;
+    grid-template-columns: 6.1rem minmax(0, 1fr); /* "Spell resistance" goes on two lines: more room for the values */
     padding: .3rem .9rem;
   }
   .stats-table dt, .stats-table dd { padding: .45rem 0; border-bottom: 1px solid rgba(107, 88, 66, .15); }
-  .stats-table dt { font-size: .62rem; padding-top: .6rem; }
-  .stats-table dd { margin: 0; font-size: .95rem; }
+  .stats-table dt { font-size: .62rem; padding-top: .6rem; padding-right: .3rem; line-height: 1.35; }
+  .stats-table dd { margin: 0; padding-left: .5rem; font-size: .95rem; }
   .stats-table dt:last-of-type, .stats-table dd:last-of-type { border-bottom: 0; }
   .description { font-size: 1.05rem; line-height: 1.62; hyphens: auto; }
   .description p.first::first-letter { font-size: 2.8em; }
+  .base-spell { padding: .85rem .9rem .95rem; }
   .sheet-actions { gap: .5rem; }
   .sheet-actions label { width: 100%; display: flex; align-items: center; justify-content: space-between; }
   .sheet-actions .spacer { display: none; }
   .sheet-actions .button { flex: 1 1 auto; justify-content: center; }
+  .sheet-actions .in-books, .sheet-actions .not-in-book { flex: 1 1 100%; }
 }
 
 /* fingers instead of a mouse: targets of at least ~44px */

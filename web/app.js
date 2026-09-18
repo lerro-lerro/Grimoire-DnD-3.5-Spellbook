@@ -2918,7 +2918,7 @@ function scrollSummary(entry) {
     const price = scrollPrice(level, entry.spell, cls);
     const owned = scrollCount(entry.spell.id, cls);
     return `${classes.length > 1 ? `${esc(cls.name)}: ` : ""}caster level ${price.casterLevel} · ${esc(coins(price.market))}${price.costs.variable ? " or more" : ""}`
-      + `${owned ? ` · <b>${owned} owned, ${esc(coins(price.market * owned))}${price.costs.variable ? "+" : ""} in total</b>` : ""}`;
+      + `${owned ? `<br><b>${owned} owned, ${esc(coins(price.market * owned))}${price.costs.variable ? "+" : ""} in total</b>` : ""}`;
   }).join("<br>");
 }
 
@@ -3833,6 +3833,18 @@ function sheetForbidden(inc, entry) {
   return `<p class="forbidden-note">${esc(forbiddenSchool(inc, forbidding[0]))} is a forbidden school for your ${esc(forbidding.map((c) => c.name).join(" and "))}: its spells can't be learned or prepared.</p>`;
 }
 
+// "Refresh" alone on a phone, so it fits next to "dndtools ↗"
+const REFRESH_LABEL = `Refresh<span class="wide-only-bar">from dndtools</span>`;
+
+// On a phone the sheet's top bar (name and ×) stays on screen: the name shows once the title has scrolled away
+function markSheetScrolled(event) {
+  const sheet = event.target;
+  const bar = sheet.querySelector?.(":scope > .sheet-top");
+  const title = sheet.querySelector?.(":scope > h2");
+  if (!bar || !title) return;
+  sheet.classList.toggle("scrolled", title.getBoundingClientRect().bottom < bar.getBoundingClientRect().bottom);
+}
+
 function inheritedNote(inc, key) {
   const name = inc.inherited_from?.keys?.[key];
   return name ? ` <small class="inherited">from ${esc(name)}</small>` : "";
@@ -3878,7 +3890,10 @@ function showSheet(id, { from = null } = {}) {
 
   $("#sheet").innerHTML = `
     <article class="parchment sheet" style="--c:${schoolColor(inc)}">
-      <button class="sheet-close" type="button" data-close aria-label="Close">×</button>
+      <div class="sheet-top">
+        <span class="sheet-top-name" aria-hidden="true">${esc(inc.name)}</span>
+        <button class="sheet-close" type="button" data-close aria-label="Close">×</button>
+      </div>
       <h2>${esc(inc.name)}</h2>
       <div class="school-line">${schoolLine(inc)}</div>
       ${sheetForbidden(inc, entry)}
@@ -3908,7 +3923,7 @@ function showSheet(id, { from = null } = {}) {
         ${from ? `<button class="button" type="button" data-ref="${esc(from)}">← Back</button>` : ""}
         ${inc.handwritten ? (editable ? `<button class="button" type="button" id="sheet-edit">Edit spell</button>` : "") : `
         <a class="button" href="${esc(inc.url)}" target="_blank" rel="noopener">dndtools ↗</a>
-        <button class="button" type="button" id="sheet-refresh">Refresh from dndtools</button>`}
+        <button class="button" type="button" id="sheet-refresh">${REFRESH_LABEL}</button>`}
       </div>` : entry && locked ? `
       <div class="sheet-actions">
         <span class="not-in-book">“${esc(state.book.name)}” is ${esc(unavailableLabel(state.book).toLowerCase())}: it can't be changed.</span>
@@ -3926,7 +3941,7 @@ function showSheet(id, { from = null } = {}) {
         ${from ? `<button class="button" type="button" data-ref="${esc(from)}">← Back</button>` : ""}
         ${inc.handwritten ? `<button class="button" type="button" id="sheet-edit">Edit spell</button>` : `
         <a class="button" href="${esc(inc.url)}" target="_blank" rel="noopener">dndtools ↗</a>
-        <button class="button" type="button" id="sheet-refresh">Refresh from dndtools</button>`}
+        <button class="button" type="button" id="sheet-refresh">${REFRESH_LABEL}</button>`}
         <button class="button danger" type="button" id="sheet-remove">Remove</button>
       </div>` : `
       <div class="sheet-actions">
@@ -3963,8 +3978,9 @@ function showSheet(id, { from = null } = {}) {
     openHandwrittenDialog(inc);
   });
   $("#sheet-refresh")?.addEventListener("click", async (event) => {
-    event.target.disabled = true;
-    event.target.textContent = "Checking dndtools…";
+    const button = event.currentTarget;  // not event.target: a tap on the label's span
+    button.disabled = true;
+    button.textContent = "Checking dndtools…";
     try {
       await api(`spells/${inc.id}/refresh`, { method: "POST" });
       await reloadView();
@@ -3972,8 +3988,8 @@ function showSheet(id, { from = null } = {}) {
       notify(`${inc.name} refreshed from dndtools.`);
     } catch (error) {
       notify(error.message, true);
-      event.target.disabled = false;
-      event.target.textContent = "Refresh from dndtools";
+      button.disabled = false;
+      button.innerHTML = REFRESH_LABEL;
     }
   });
   $("#sheet-remove")?.addEventListener("click", async () => {
@@ -5461,6 +5477,7 @@ document.addEventListener("keydown", (event) => {
   }
 });
 
+$("#sheet").addEventListener("scroll", markSheetScrolled, { capture: true, passive: true });  // scroll doesn't bubble
 $("#sheet").addEventListener("click", (event) => {
   const favorite = event.target.closest("[data-favorite]");
   if (favorite) {
