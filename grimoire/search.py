@@ -13,7 +13,13 @@ dndtools quirks handled here:
   fetched in parallel (`pool`), and `progress.add(n)` / `progress.step()` report how many are done. There is no
   limit on the pages: when `progress.cancelled` becomes true (the user pressed "Stop") the pages not yet
   downloaded are skipped and the results found so far are returned;
-- the same spell can appear more than once in the results.
+- the same spell can appear more than once in the results;
+- names are "Invisibility, Greater", "Cure Light Wounds, Mass": a name is searched word by word, in any order
+  (dndtools gets only the longest word, the rest is checked here);
+- a few spell links have capital letters ("/Solipism--4190/"): they are kept as they are.
+
+The editions are always checked here, not by dndtools, so the search can tell how many spells only the
+editions left out (`other_editions`).
 """
 
 import math
@@ -38,11 +44,34 @@ MULTI_FILTERS = ("rulebook__dnd_edition__slug", "spellclasslevel__level", "spell
 # filters that the exact class lists can check by themselves; the others need the dndtools search
 LOCAL_FILTERS = ("name", "school__slug", "rulebook__slug", "rulebook__dnd_edition__slug")
 SLUG_RE = re.compile(r"^[a-z0-9-]{1,80}$")
-ROW_BOOK_RE = re.compile(r"^/rulebooks/([a-z0-9-]+)--\d+/([a-z0-9-]+)--\d+/")
+ROW_BOOK_RE = re.compile(r"^/rulebooks/([A-Za-z0-9-]+)--\d+/([A-Za-z0-9-]+)--\d+/")
 
 
 def _spaces(text):
     return re.sub(r"\s+", " ", text or "").strip()
+
+
+def name_words(text):
+    """"Greater Invisibility" -> ["greater", "invisibility"]; curly apostrophes (phones) become straight ones."""
+    text = (text or "").lower().replace("’", "'").replace("‘", "'")
+    return [word.strip("'") for word in re.findall(r"[\w']+", text) if word.strip("'")]
+
+
+def name_matches(name, words):
+    """True if every word is in the name, in any order ("greater invisibility" finds "Invisibility, Greater")."""
+    name = " ".join(name_words(name))
+    return all(word in name for word in words)
+
+
+def remote_filters(filters):
+    """The filters sent to dndtools: no editions (checked here) and only the longest word of the name."""
+    remote = {key: value for key, value in filters.items() if key != "rulebook__dnd_edition__slug"}
+    words = name_words(filters.get("name"))
+    if words:
+        remote["name"] = max(words, key=len)
+    else:
+        remote.pop("name", None)
+    return remote
 
 
 def filter_options():
@@ -125,10 +154,10 @@ def parse_rows(page_html):
             "url": url,
             "name": _spaces(link[0].text_content()),
             "school": _spaces(cells[1].text_content()),
-            "schools": re.findall(r"/spells/schools/([a-z0-9-]+)/", " ".join(cells[1].xpath(".//a/@href"))),
+            "schools": re.findall(r"/spells/schools/([a-z0-9-]+)/", " ".join(cells[1].xpath(".//a/@href")).lower()),
             "rulebook": _spaces(cells[2].text_content()),
-            "rulebook_slug": book.group(2) if book else "",
-            "edition": book.group(1) if book else "",
+            "rulebook_slug": book.group(2).lower() if book else "",
+            "edition": book.group(1).lower() if book else "",
             "duration": units.convert_text(_spaces(cells[4].text_content()), is_stat=True),
             "range": units.convert_text(_spaces(cells[5].text_content()), is_stat=True),
             "components": [_spaces(a.text_content()) for a in cells[6].xpath(".//abbr")],
@@ -185,13 +214,13 @@ def fetch_lists(specs, pool, progress):
     return lists, failed.is_set()
 
 
-def matches_locally(row, filters):
-    name = filters.get("name", "").lower()
-    editions = filters.get("rulebook__dnd_edition__slug")
-    return ((not name or name in row["name"].lower())
+def matches_locally(row, filters, editions=True):
+    """The filters of LOCAL_FILTERS; editions=False leaves the editions out (to count what they hide)."""
+    wanted = filters.get("rulebook__dnd_edition__slug") if editions else None
+    return (name_matches(row["name"], name_words(filters.get("name")))
             and (not filters.get("school__slug") or filters["school__slug"] in row["schools"])
             and (not filters.get("rulebook__slug") or filters["rulebook__slug"] == row["rulebook_slug"])
-            and (not editions or row["edition"] in editions))
+            and (not wanted or row["edition"] in wanted))
 
 
 def unique(rows):
@@ -238,21 +267,25 @@ def search(filters, pool, progress):
         for level in levels:
             for row in lists[level]:
                 found.setdefault(row["id"], {**row, "level": level})
-        rows = [row for row in found.values() if matches_locally(row, filters)]
+        rows = list(found.values())
         others = [key for key in filters if key not in LOCAL_FILTERS
                   and key not in ("class_levels__slug", "spellclasslevel__level")]
-        if others and rows:
+        if others and any(matches_locally(row, filters, editions=False) for row in rows):
             # the other filters need the dndtools search; without the level it is much faster,
             # and the level is already exact here
             narrowed = {key: value for key, value in filters.items() if key != "spellclasslevel__level"}
-            searched, more_incomplete = fetch_lists([("search", "/spells/", query(narrowed))], pool, progress)
+            searched, more_incomplete = fetch_lists([("search", "/spells/", query(remote_filters(narrowed)))], pool, progress)
             ids = {row["id"] for row in searched["search"]}
             rows = [row for row in rows if row["id"] in ids]
             incomplete = incomplete or more_incomplete
     else:
-        lists, incomplete = fetch_lists([("search", "/spells/", query(filters))], pool, progress)
+        lists, incomplete = fetch_lists([("search", "/spells/", query(remote_filters(filters)))], pool, progress)
         rows = unique(lists["search"])
+    # dndtools had only the longest word of the name and no editions: the rest is checked here
+    rows = [row for row in rows if matches_locally(row, filters, editions=False)]
     if domain and domain_levels:
         rows = check_domain_levels(rows, domain, domain_levels, pool, progress)
-    rows.sort(key=lambda row: (row.get("level", row.get("domain_level", 0)), row["name"].lower()))
-    return {"results": rows, "incomplete": incomplete and not stopped(progress), "stopped": stopped(progress)}
+    shown = [row for row in rows if matches_locally(row, filters)]
+    shown.sort(key=lambda row: (row.get("level", row.get("domain_level", 0)), row["name"].lower()))
+    return {"results": shown, "other_editions": len(rows) - len(shown),
+            "incomplete": incomplete and not stopped(progress), "stopped": stopped(progress)}

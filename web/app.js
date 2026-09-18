@@ -79,6 +79,9 @@ const state = {
   onlyPrepared: false,
   onlyOwned: false,
   onlyFavorites: false,
+  fieldFilters: {},     // "More filters": field -> text (every word of it must be in that field of the sheet)
+  componentFilters: {}, // "More filters": component -> "with" | "without"
+  moreFilters: false,   // the "More filters" panel is open
   saveQueue: Promise.resolve(), // prepared-spell saves run one at a time
   selecting: false,  // Spellbook tab: cards are picked (to remove several at once) instead of opened
   selected: new Set(), // ids of the picked spells
@@ -203,13 +206,73 @@ function askConfirm(title, text, label = "Confirm", option = null) {
   });
 }
 
-// ---------- long lists: only what changed is redrawn ----------
+// ---------- long lists: only what changed is redrawn, only what is near the screen is on the page ----------
 // With thousands of spells, rebuilding every card or row after each click takes seconds (on a phone even more).
-// patchList keeps the elements whose HTML didn't change; patchSections does it for the level sections, whose
-// "head" (title, pips) and rows are compared separately.
-const patchMemory = new WeakMap(); // element -> {key, html}
+// - A section's rows are split in blocks of BLOCK rows (each block is the grid or list itself, .row-block).
+// - Big lists (more than SMALL_LIST rows in a container): only the blocks near the screen hold their rows; the
+//   others are empty blocks as tall as their rows would be (blockHeight), filled when they come near (fillNearBlocks
+//   right after drawing, then observerOf(root) while scrolling) and emptied when they go far. So a filter change, or
+//   opening a book with every spell, costs the few blocks in view whatever the number of spells: Firefox spends
+//   about 0.1 ms per card that appears or disappears, hundreds of ms for thousands of cards.
+//   The browser's find (Ctrl+F) only sees the cards on the page: small lists keep them all (filled in the background).
+// - patchList keeps the row elements (the section's pool) and reuses one whose HTML didn't change. A row checked
+//   since the data last changed (memo.gen === listGen) is still right: a filter change doesn't even build its HTML.
+// - The lists of the page scroll with the page; the one of "Add scrolls" scrolls in its dialog (`root`), and its
+//   rows depend on what is chosen, not only on the data (its own `gen`).
+const patchMemory = new WeakMap(); // row element -> {key, html, gen}
+const blockState = new WeakMap();  // block -> {items, keys, pool, decorate, listClass, columns, always, live, measured, root, gen}
+const BLOCK = 24;       // rows per block: whole rows of a grid of 1, 2 or 3 columns
+const SMALL_LIST = 500; // rows in a container up to which every block keeps its rows
+let listGen = 0;        // +1 at every drawing of a tab that isn't just a filter change
+let filterPass = false; // true while a filter change draws the tab again
 
-// A row whose HTML is only built when it is needed (a big list shows its first rows before building the others)
+// A filter changed, nothing else: the rows drawn since the last change of the data are only moved
+let refilterCost = 0; // ms the last filter change took
+let refilterTimer = null;
+
+function refilter() {
+  clearTimeout(refilterTimer);
+  const start = performance.now();
+  filterPass = true;
+  try {
+    renderView();
+  } finally {
+    filterPass = false;
+    refilterCost = performance.now() - start;
+  }
+  updateActiveFilters();
+}
+
+// While typing: at once when a filter change is quick, after a pause in the typing when it is slow (a slow phone
+// with thousands of spells), so the keys don't wait for every letter to be drawn
+function refilterSoon() {
+  clearTimeout(refilterTimer);
+  refilterTimer = setTimeout(refilter, refilterCost > 50 ? 150 : 0);
+}
+
+// Worked out from the data alone (levels, rows of a list): reused by the filter changes until the data changes
+const dataCache = new Map(); // name -> {gen, value}
+
+function fromData(name, make) {
+  const hit = dataCache.get(name);
+  if (hit && hit.gen === listGen) return hit.value;
+  const value = make();
+  dataCache.set(name, { gen: listGen, value });
+  return value;
+}
+
+// The lazy row of a piece of data, the same object until the data changes (so its HTML is built once)
+const lazyRowCache = new WeakMap(); // data -> {gen, row}
+
+function cachedRow(data, key, make) {
+  const hit = lazyRowCache.get(data);
+  if (hit && hit.gen === listGen) return hit.row;
+  const row = lazyRow(key, make);
+  lazyRowCache.set(data, { gen: listGen, row });
+  return row;
+}
+
+// A row whose HTML is only built when it is needed (a block far from the screen never builds its rows)
 function lazyRow(key, make) {
   let html;
   return {
@@ -221,71 +284,206 @@ function lazyRow(key, make) {
   };
 }
 
-// items: [{key, html}], each html a single element; decorate(element) runs on the elements it creates
-function patchList(parent, items, decorate = null) {
-  const old = new Map();
-  for (const child of [...parent.children]) {
-    const memo = patchMemory.get(child);
-    if (memo && !old.has(memo.key)) old.set(memo.key, { el: child, html: memo.html });
-    else child.remove();
+// items: [{key, html}] of a section, each html a single element. Blocks are reused in place; the rows go in the
+// blocks near the screen (or all of them for a small list), the other blocks only get their height.
+// spec: {tag, className, listClass, pool (key -> row element, the section's), decorate, columns, always,
+//        root (the scrolling element, null for the page), gen (() => the generation the rows are checked against)}
+function patchList(list, items, spec) {
+  const blocks = [...list.children];
+  const count = Math.ceil(items.length / BLOCK);
+  for (let b = 0; b < count; b++) {
+    const slice = items.slice(b * BLOCK, (b + 1) * BLOCK);
+    const keys = slice.map((item) => item.key);
+    let block = blocks[b];
+    if (!block) {
+      block = document.createElement(spec.tag);
+      block.className = spec.className;
+      list.append(block);
+      observerOf(spec.root).observe(block);
+    }
+    let st = blockState.get(block);
+    if (!st) blockState.set(block, st = { live: false, measured: null, keys: null });
+    const sameRowsAsBefore = st.keys && sameKeys(st.keys, keys);
+    if (!sameRowsAsBefore) st.measured = null; // other rows: its height is guessed again
+    Object.assign(st, { items: slice, keys, pool: spec.pool, decorate: spec.decorate, listClass: spec.listClass,
+      columns: spec.columns, always: spec.always, root: spec.root, gen: spec.gen });
+    // a block with its rows keeps them if they are the same ones (or it has the focus, or the list is small);
+    // one that gets other rows is emptied: fillNearBlocks fills it again only if it is near the screen
+    if (st.live && (sameRowsAsBefore || spec.always || block.contains(document.activeElement))) fillBlock(block);
+    else {
+      st.live = false;
+      if (block.firstChild) block.replaceChildren();
+      const height = `${blockHeight(st)}px`;
+      if (block.style.height !== height) block.style.height = height;
+    }
   }
-  const elements = new Array(items.length);
+  for (const old of blocks.slice(count)) {
+    observerOf(blockState.get(old)?.root).unobserve(old);
+    old.remove();
+  }
+}
+
+// The rows of a block on the page: kept elements reused, the others built from their HTML (all at once)
+function fillBlock(block) {
+  const st = blockState.get(block);
+  if (!st) return;
+  const rows = new Array(st.items.length);
   const fresh = [];
-  items.forEach((item, i) => {
-    const kept = old.get(item.key);
-    if (kept && kept.html === item.html) {
-      elements[i] = kept.el;
-      old.delete(item.key);
+  const gen = st.gen();
+  st.items.forEach((item, i) => {
+    const el = st.pool.get(item.key);
+    const memo = el && patchMemory.get(el);
+    if (memo && (memo.gen === gen || memo.html === item.html)) {
+      memo.gen = gen;
+      rows[i] = el;
     } else {
       fresh.push(i);
     }
   });
   if (fresh.length) {
     const template = document.createElement("template");
-    template.innerHTML = fresh.map((i) => items[i].html).join("");
+    template.innerHTML = fresh.map((i) => st.items[i].html).join("");
     const created = [...template.content.children];
     fresh.forEach((i, n) => {
-      elements[i] = created[n];
-      patchMemory.set(created[n], { key: items[i].key, html: items[i].html });
-      decorate?.(created[n]);
+      rows[i] = created[n];
+      st.pool.set(st.items[i].key, created[n]);
+      patchMemory.set(created[n], { key: st.items[i].key, html: st.items[i].html, gen });
     });
   }
-  for (const { el } of old.values()) el.remove();
-  let cursor = parent.firstElementChild;
-  for (const el of elements) {
-    if (el === cursor) cursor = cursor.nextElementSibling;
-    else parent.insertBefore(el, cursor);
+  if (!sameRows(block, rows)) placeRows(block, rows);
+  if (st.decorate) for (const el of rows) st.decorate(el); // picks made while the row was off the page
+  if (block.style.height) block.style.height = "";
+  st.live = true;
+}
+
+// A block far from the screen gives its rows back to the pool and keeps its height
+function emptyBlock(block, height) {
+  const st = blockState.get(block);
+  if (!st?.live || st.always || block.contains(document.activeElement)) return; // the focus stays where it is
+  if (height > 0) {
+    st.measured = height;
+    const rows = Math.ceil(st.keys.length / st.columns);
+    const gap = ROW_GAP[st.listClass];
+    rowHeight[st.listClass] = 0.7 * rowHeight[st.listClass] + 0.3 * ((height + gap) / rows); // learned as it goes
+  }
+  block.style.height = `${blockHeight(st)}px`;
+  block.replaceChildren();
+  st.live = false;
+}
+
+// Height of a block without its rows: measured when it had them, otherwise guessed from its rows
+const PHONE = matchMedia("(max-width: 700px)");
+const ROW_GAP = { "spell-grid": 16, "prep-list": 7, "cart-list": 6 };
+const rowHeight = { "spell-grid": PHONE.matches ? 300 : 296, "prep-list": PHONE.matches ? 118 : 71, "cart-list": PHONE.matches ? 147 : 94 };
+
+function blockHeight(st) {
+  if (st.measured) return st.measured;
+  const rows = Math.ceil(st.keys.length / st.columns);
+  return Math.max(0, Math.round(rows * rowHeight[st.listClass] - ROW_GAP[st.listClass]));
+}
+
+// Columns of the spell grid (repeat(auto-fill, minmax(300px, 1fr)) with a 1rem gap; one column on a phone)
+let gridColumns = 3;
+
+function columnsOf(container, listClass) {
+  if (listClass !== "spell-grid") return 1;
+  if (PHONE.matches) return 1;
+  const width = container.clientWidth - 2 * parseFloat(getComputedStyle(container).paddingLeft || 0);
+  if (width > 0) gridColumns = Math.max(1, Math.min(3, Math.floor((width + 16) / 316)));
+  return gridColumns;
+}
+
+// Blocks that come near the screen (or near the visible part of their dialog) get their rows, the ones that go
+// far give them back. One observer per scrolling element (null: the page).
+const blockObservers = new Map();
+
+function observerOf(root) {
+  let observer = blockObservers.get(root ?? null);
+  if (!observer) {
+    observer = new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.target.isConnected) continue;
+        if (entry.isIntersecting) fillBlock(entry.target);
+        else emptyBlock(entry.target, entry.boundingClientRect.height);
+      }
+    }, { root: root ?? null, rootMargin: "150% 0px" });
+    blockObservers.set(root ?? null, observer);
+  }
+  return observer;
+}
+
+// Right after drawing: the blocks in and near the screen (or the visible part of `root`) get their rows now, not a
+// frame later
+function fillNearBlocks(container, root = null) {
+  const view = root ? root.getBoundingClientRect() : { top: 0, bottom: innerHeight };
+  const margin = (view.bottom - view.top) * 1.5;
+  for (let pass = 0; pass < 2; pass++) {
+    const near = [];
+    search: for (const section of container.children) {
+      if (section.hidden || section.classList.contains("folded")) continue;
+      const list = sectionParts.get(section)?.list;
+      if (!list || list.hidden) continue;
+      for (const block of list.children) {
+        const box = block.getBoundingClientRect(); // no change in between: one layout for all of them
+        if (box.top > view.bottom + margin) break search; // the ones after it are further down
+        if (box.bottom > view.top - margin && !blockState.get(block)?.live) near.push(block);
+      }
+    }
+    if (!near.length) return;
+    near.forEach(fillBlock);
   }
 }
 
-// sections: [{key, level, className, id?, head, listTag, listClass, rows: [{key, html}], empty}]
-// Inside a section: the head nodes, then the list (or the `empty` element when there are no rows).
-// When most rows are new (a big book just opened), CHUNK rows are drawn now and the others right after,
-// so the page shows up at once instead of after every card has been built.
-const sectionParts = new WeakMap();
-const CHUNK = 150;
-const pendingSections = new WeakMap(); // container -> timer of the next piece
-const drawingInPieces = new WeakSet();   // containers whose rows are being drawn piece by piece
+function sameKeys(a, b) {
+  return a.length === b.length && a.every((key, i) => key === b[i]);
+}
 
-function patchSections(container, sections, decorate = null) {
-  if (pendingSections.has(container)) {
-    clearTimeout(pendingSections.get(container));
-    pendingSections.delete(container);
+function sameRows(block, rows) {
+  if (block.childElementCount !== rows.length) return false;
+  let child = block.firstElementChild;
+  for (const el of rows) {
+    if (child !== el) return false;
+    child = child.nextElementSibling;
   }
-  let total = 0;
-  let drawnBefore = 0;
-  for (const section of sections) total += section.rows.length;
-  for (const child of container.children) drawnBefore += sectionParts.get(child)?.list.childElementCount || 0;
-  if (total - drawnBefore > CHUNK && total > 2 * drawnBefore) drawingInPieces.add(container);
-  // a small first piece shows the page at once; bigger pieces then mean fewer layouts of the growing grid
-  let budget = drawingInPieces.has(container) ? (drawnBefore ? 4 * CHUNK : CHUNK) : Infinity;
-  let unfinished = false;
-  const existing = new Map();
+  return true;
+}
+
+function placeRows(block, rows) {
+  let cursor = block.firstElementChild;
+  for (const el of rows) {
+    if (el === cursor) cursor = cursor.nextElementSibling;
+    else block.insertBefore(el, cursor);
+  }
+  while (cursor) {
+    const next = cursor.nextElementSibling;
+    cursor.remove();
+    cursor = next;
+  }
+}
+
+// sections: [{key, level?, className, id?, head, listTag, listClass, rows: [{key, html}], hidden?, empty}]
+// hidden = a filter left nothing in it: the section stays on the page, hidden (its blocks are mostly empty).
+// Inside a section: the head nodes, then the list of blocks, or the `empty` element when there are no rows at all.
+const sectionParts = new WeakMap();
+const sectionStash = new WeakMap(); // container -> Map(key -> section element), shown or taken out
+const sectionContainers = new Set(); // containers of level sections, see levelSections
+
+// options: {root (the scrolling element, when it isn't the page), gen (see patchList)}
+function patchSections(container, sections, decorate = null, { root = null, gen = () => listGen } = {}) {
+  sectionContainers.add(container);
+  // every section this container had, also the ones taken out (or that an "empty" message replaced)
+  let existing = sectionStash.get(container);
+  if (!existing) sectionStash.set(container, existing = new Map());
   for (const child of [...container.children]) {
     const key = child.dataset.sectionKey;
-    if (key !== undefined && !existing.has(key)) existing.set(key, child);
-    else child.remove();
+    if (key === undefined || (existing.has(key) && existing.get(key) !== child)) child.remove();
+    else existing.set(key, child);
   }
+  let total = 0;
+  for (const section of sections) if (!section.hidden) total += section.rows.length;
+  const always = total <= SMALL_LIST;
+  const columns = {};
+  for (const section of sections) columns[section.listClass] ??= columnsOf(container, section.listClass);
   const wanted = new Set(sections.map((s) => s.key));
   for (const [key, el] of existing) if (!wanted.has(key)) el.remove();
   let cursor = container.firstElementChild;
@@ -294,55 +492,77 @@ function patchSections(container, sections, decorate = null) {
     if (!el) {
       el = document.createElement("section");
       el.dataset.sectionKey = section.key;
+      existing.set(section.key, el);
     }
     if (el.className !== section.className) el.className = section.className;
-    if (el.dataset.levelSection !== String(section.level)) el.dataset.levelSection = section.level;
+    if (section.level === undefined) delete el.dataset.levelSection;
+    else if (el.dataset.levelSection !== String(section.level)) el.dataset.levelSection = section.level;
     if (el.dataset.count !== String(section.rows.length)) el.dataset.count = section.rows.length;
     if (section.id && el.id !== section.id) el.id = section.id;
+    if (el.hidden !== Boolean(section.hidden)) el.hidden = Boolean(section.hidden);
     let parts = sectionParts.get(el);
-    const listKind = section.rows.length ? "list" : "empty";
-    if (!parts || parts.kind !== listKind || (listKind === "empty" && parts.empty !== section.empty)) {
-      parts?.list.remove();
-      const list = listKind === "list" ? document.createElement(section.listTag) : document.createElement("template");
-      if (listKind === "list") {
-        list.className = section.listClass;
+    if (!parts) sectionParts.set(el, parts = { head: null, headNodes: [], pool: new Map(), list: null, items: null, empty: null, emptyNode: null });
+    if (!section.hidden) {
+      const rows = section.rows;
+      if (rows.length && !parts.list) {
+        parts.list = document.createElement("div");
+        parts.list.className = `row-blocks ${section.listClass}-blocks`;
+        el.append(parts.list);
       }
-      let node = list;
-      if (listKind === "empty") {
-        list.innerHTML = section.empty;
-        node = list.content.firstElementChild;
+      if (parts.list && parts.list.hidden === rows.length > 0) parts.list.hidden = !rows.length;
+      if (rows.length) {
+        parts.emptyNode?.remove();
+        parts.emptyNode = parts.empty = null;
+      } else if (parts.empty !== section.empty) {
+        parts.emptyNode?.remove();
+        const template = document.createElement("template");
+        template.innerHTML = section.empty || "";
+        parts.emptyNode = template.content.firstElementChild;
+        parts.empty = section.empty;
+        if (parts.emptyNode) el.append(parts.emptyNode);
       }
-      el.append(node);
-      parts = { ...(parts || { head: null, headNodes: [] }), kind: listKind, empty: section.empty, list: node };
-      sectionParts.set(el, parts);
-    }
-    if (parts.head !== section.head) {
-      for (const node of parts.headNodes) node.remove();
-      const template = document.createElement("template");
-      template.innerHTML = section.head;
-      parts.headNodes = [...template.content.children];
-      el.insertBefore(template.content, parts.list);
-      parts.head = section.head;
-    }
-    if (listKind === "list") {
-      const had = parts.list.childElementCount;
-      const allowed = Math.min(section.rows.length, had + budget);
-      if (allowed < section.rows.length) unfinished = true;
-      patchList(parts.list, allowed < section.rows.length ? section.rows.slice(0, allowed) : section.rows, decorate);
-      if (budget !== Infinity) budget = Math.max(0, budget - Math.max(0, allowed - had));
+      if (parts.head !== section.head) {
+        for (const node of parts.headNodes) node.remove();
+        const template = document.createElement("template");
+        template.innerHTML = section.head;
+        parts.headNodes = [...template.content.children];
+        el.prepend(template.content);
+        parts.head = section.head;
+      }
+      // the same rows as last time (a filter change that left this level as it was): nothing to do
+      if (rows.length && (parts.items !== rows || parts.always !== always)) {
+        patchList(parts.list, rows, { tag: section.listTag, className: `${section.listClass} row-block`,
+          listClass: section.listClass, pool: parts.pool, decorate, columns: columns[section.listClass], always, root, gen });
+        parts.items = rows;
+        parts.always = always;
+      }
     }
     if (el === cursor) cursor = cursor.nextElementSibling;
     else container.insertBefore(el, cursor);
   }
-  if (unfinished) {
-    // a timer, not an animation frame: rows added off screen don't make the browser draw a new frame
-    pendingSections.set(container, setTimeout(() => {
-      pendingSections.delete(container);
-      patchSections(container, sections, decorate);
-    }, 0));
-  } else {
-    drawingInPieces.delete(container);
+  fillNearBlocks(container, root);
+  // a small list keeps every row on the page: the others are filled a few at a time
+  if (always) {
+    const blocks = [...container.querySelectorAll(":scope > section:not([hidden]) > .row-blocks > .row-block")];
+    inBackground(blocks, (block) => { if (!blockState.get(block)?.live) fillBlock(block); }, () => container.isConnected);
   }
+}
+
+// The level sections shown in a tab (a book page, or the class blocks of Prepared and Scrolls), found without
+// searching through their thousands of rows
+function levelSections(view) {
+  const found = [];
+  for (const container of sectionContainers) {
+    if (!container.isConnected) {
+      sectionContainers.delete(container);
+      continue;
+    }
+    if (!view?.contains(container)) continue;
+    for (const section of container.children) {
+      if (section.dataset.levelSection !== undefined && !section.hidden) found.push(section);
+    }
+  }
+  return found;
 }
 
 // Spells of the character by ID, and of the open book by ID (rebuilt when the lists are loaded again)
@@ -453,6 +673,8 @@ async function showBook(id, view = state.view, characterId = null) {
   if (!state.book || state.book.id !== id || (!id && state.character?.id !== characterId)) {
     app.innerHTML = `<p class="loading">Opening the book…</p>`;
     state.textFilter = "";
+    state.fieldFilters = {};
+    state.componentFilters = {};
     state.schoolFilters.clear();
     state.bookFilters.clear();
   }
@@ -479,6 +701,9 @@ async function showBook(id, view = state.view, characterId = null) {
     return;
   }
   renderBook();
+  // the words the search box looks at, ready before the first search (thousands of spells)
+  const opened = state.book;
+  inBackground(opened.spells, (entry) => searchText(entry.spell), () => state.book === opened);
 }
 
 function compareNames(a, b) {
@@ -534,32 +759,218 @@ function collectionPath(book = state.book) {
   return book.all ? `#/character/${encodeURIComponent(state.character.id)}` : `#/book/${encodeURIComponent(book.id)}`;
 }
 
-// The filter bar above the tabs (text, favorites, spellbooks, schools) works the same in all three tabs.
+// The filter bar above the tabs (text, favorites, spellbooks, schools, "More filters") works the same in all three tabs.
 // books = the spellbooks that contain the spell (entry.books), for the spellbook chips of "All spellbooks".
 function matchesFilters(spell, books = []) {
   if (state.schoolFilters.size && !state.schoolFilters.has(spell.school)) return false;
   if (state.bookFilters.size && state.book.all && !books.some((b) => state.bookFilters.has(b.id))) return false;
   if (state.onlyFavorites && !isFavorite(spell.id)) return false;
-  const text = state.textFilter.trim().toLowerCase();
-  if (!text) return true;
-  return searchText(spell).includes(text);
+  for (const [code, wanted] of Object.entries(state.componentFilters)) {
+    if ((spell.components || []).includes(code) !== (wanted === "with")) return false;
+  }
+  for (const [field, text] of Object.entries(state.fieldFilters)) {
+    const words = wordsOf(text);
+    if (words.length && !narrowedMatch(field, words, spell, () => matchesField(spell, field, words))) return false;
+  }
+  const words = wordsOf(state.textFilter);
+  return !words.length || narrowedMatch("text", words, spell, () => hasWords(searchText(spell), words));
 }
+
+// Typing more letters only narrows a search ("fir" -> "fire"): a spell the shorter search left out is left out at
+// once, without reading its texts again. Per filter: the spells checked and left out for its last words.
+const narrowing = new Map(); // filter -> {words, failed: Set of spell ids, before, gen, texts}
+
+function narrowedMatch(filter, words, spell, test) {
+  let memo = narrowing.get(filter);
+  if (!memo || memo.words !== words) {
+    const same = memo && memo.gen === listGen && memo.texts === spellTexts.map;
+    memo = { words, failed: new Set(), before: same && narrows(words, memo.words) ? memo.failed : null, gen: listGen, texts: spellTexts.map };
+    narrowing.set(filter, memo);
+  }
+  if (memo.gen === listGen && memo.texts === spellTexts.map) {
+    if (memo.failed.has(spell.id)) return false;
+    if (memo.before?.has(spell.id)) {
+      memo.failed.add(spell.id);
+      return false;
+    }
+  } else {
+    narrowing.delete(filter); // the data or the texts changed meanwhile: nothing to go by
+    return test();
+  }
+  if (test()) return true;
+  memo.failed.add(spell.id);
+  return false;
+}
+
+// Every word of the old search is inside a word of the new one: whatever the old one left out, the new one does too
+function narrows(words, old) {
+  return old.every((word) => words.some((longer) => longer.includes(word)));
+}
+
+// "Greater Invisibility" -> ["greater", "invisibility"]: a search matches every word, in any order (dndtools names
+// the spell "Invisibility, Greater"). Curly apostrophes (typed on phones) count as straight ones.
+function searchWords(text) {
+  return (String(text ?? "").toLowerCase().replace(/[‘’]/g, "'").match(/[\p{L}\p{N}_']+/gu) || [])
+    .map((word) => word.replace(/^'+|'+$/g, "")).filter(Boolean);
+}
+
+const wordCache = new Map();
+
+function wordsOf(text) {
+  let words = wordCache.get(text);
+  if (!words) {
+    if (wordCache.size > 100) wordCache.clear();
+    wordCache.set(text, words = searchWords(text));
+  }
+  return words;
+}
+
+// The words of a text, lowercase, one space apart: searchWords in a single pass (thousands of descriptions)
+function normalText(...parts) {
+  return parts.flat(Infinity).filter(Boolean).join(" ").toLowerCase().replace(/[‘’]/g, "'")
+    .replace(/[^\p{L}\p{N}_']+/gu, " ").replace(/(^| )'+|'+(?= |$)/g, "$1").trim();
+}
+const hasWords = (text, words) => words.every((word) => text.includes(word));
 
 const searchTexts = new WeakMap();
 
 function searchText(spell) {
   let text = searchTexts.get(spell);
   if (text === undefined) {
-    text = [spell.name, school(spell), spell.school, spell.summary, ...(spell.descriptors || []), ...(spell.subschools || [])]
-      .join(" ").toLowerCase();
+    text = normalText(spell.name, school(spell), spell.school, spell.summary, spell.descriptors, spell.subschools);
     searchTexts.set(spell, text);
   }
   return text;
 }
 
+// "More filters": [field, label, example]. The description and the class levels aren't in the light sheets of the
+// lists: they come from GET /api/characters/<id>/texts (spellTexts), asked for when the panel opens.
+const FIELD_FILTERS = [
+  ["any", "Any field", "fire", "text"],
+  ["description", "Description", "ranged touch attack", "text"],
+  ["casting_time", "Casting time", "standard action", "casting"],
+  ["range", "Range", "touch", "casting"],
+  ["target", "Target, area or effect", "creature touched", "casting"],
+  ["duration", "Duration", "round/level", "casting"],
+  ["saving_throw", "Saving throw", "will negates", "defense"],
+  ["spell_resistance", "Spell resistance", "no", "defense"],
+  ["descriptors", "Subschool or descriptor", "fire", "kind"],
+  ["levels", "Class or domain level", "cleric 4", "kind"],
+  ["rulebook", "Rulebook", "spell compendium", "kind"],
+];
+// the sections of the panel; "wide" fields take the whole row on a phone
+const FILTER_GROUPS = [["text", "Search in"], ["casting", "Casting and effect"], ["defense", "Saving throw and resistance"], ["kind", "Kind of spell"]];
+const WIDE_FIELDS = ["any", "description", "target", "descriptors", "levels", "rulebook"];
+const COMPONENT_CHOICES = [["", "Any"], ["with", "With"], ["without", "Without"]];
+const FIELDS_NEEDING_TEXTS = ["any", "description", "levels"];
+const SHEET_FIELDS = FIELD_FILTERS.map(([field]) => field).filter((field) => !FIELDS_NEEDING_TEXTS.includes(field));
+const COMPONENT_ORDER = ["V", "S", "M", "F", "AF", "DF", "XP"];
+
+const fieldTexts = new WeakMap(); // spell -> {field: its words}
+
+function fieldText(spell, field) {
+  let fields = fieldTexts.get(spell);
+  if (!fields) fieldTexts.set(spell, fields = {});
+  if (!(field in fields)) {
+    const stats = spell.stats || {};
+    fields[field] = normalText(field === "target" ? [stats.target, stats.area, stats.effect]
+      : field === "descriptors" ? [spell.subschools, spell.descriptors]
+      : field === "rulebook" ? spell.rulebook || (spell.handwritten ? "Hand-written" : "")
+      : stats[field]);
+  }
+  return fields[field];
+}
+
+// Descriptions and class levels of the character's spells. Asked for when "More filters" opens, and again when the
+// character is reloaded (a 304 when nothing changed). map is null until they arrive.
+const spellTexts = { character: null, map: null, loading: false, error: "" };
+
+function loadSpellTexts() {
+  const pc = state.character;
+  if (!pc || spellTexts.character === pc) return;
+  if (spellTexts.character?.id !== pc.id) spellTexts.map = null; // another character's
+  Object.assign(spellTexts, { character: pc, loading: true, error: "" });
+  updateFieldFilterStatus();
+  api(`characters/${encodeURIComponent(pc.id)}/texts`).then((data) => {
+    if (spellTexts.character !== pc) return;
+    spellTexts.map = new Map(Object.entries(data.spells || {}));
+    normalizeInBackground(spellTexts.map);
+  }, (error) => {
+    if (spellTexts.character === pc) spellTexts.error = error.message;
+  }).finally(() => {
+    if (spellTexts.character !== pc) return; // a newer request is on its way
+    spellTexts.loading = false;
+    if (spellTexts.error) spellTexts.character = null; // asked again next time
+    updateFieldFilterStatus();
+    if (state.character === pc && $("#filter-bar") && usesSpellTexts()) refilter();
+  });
+}
+
+// Work on every item, 8 ms at a time between the page's own tasks, while still() holds
+function inBackground(items, work, still) {
+  let next = 0;
+  const step = () => {
+    if (!still()) return;
+    const until = performance.now() + 8;
+    while (next < items.length && performance.now() < until) work(items[next++]);
+    if (next < items.length) setTimeout(step, 0);
+  };
+  setTimeout(step, 0);
+}
+
+// The descriptions' words, prepared in the background so the first search in them doesn't wait for all of them
+function normalizeInBackground(texts) {
+  const book = state.book;
+  inBackground(book?.spells || [], (entry) => {
+    const found = texts.get(entry.spell.id);
+    if (!found) return;
+    found.normal ??= normalText(found.description);
+    found.any ??= [searchText(entry.spell), ...SHEET_FIELDS.map((field) => fieldText(entry.spell, field)), found.normal,
+      ...levelItems(entry.spell, found)].join(" ");
+  }, () => spellTexts.map === texts && state.book === book);
+}
+
+const usesSpellTexts = () => FIELDS_NEEDING_TEXTS.some((field) => wordsOf(state.fieldFilters[field] || "").length);
+
+// "Wizard 3", "Fire domain 4": a level filter must match one of them ("cleric 4" doesn't take Cleric 3, Wizard 4)
+function levelItems(spell, texts) {
+  texts.items ??= [...texts.levels, ...(spell.domains || []).map((d) => `${d.domain} domain ${d.level}`)].map((item) => normalText(item));
+  return texts.items;
+}
+
+// "Any field": every word in one of the fields (without the description and levels while they load). With the
+// texts loaded, all the fields joined in one text (texts.any, prepared in the background).
+function anyFieldMatches(spell, words) {
+  const texts = spellTexts.map?.get(spell.id);
+  if (texts?.any) return hasWords(texts.any, words);
+  return words.every((word) => searchText(spell).includes(word)
+    || SHEET_FIELDS.some((field) => fieldText(spell, field).includes(word))
+    || (texts && ((texts.normal ??= normalText(texts.description)).includes(word) || levelItems(spell, texts).some((item) => item.includes(word)))));
+}
+
+// The words of every field, prepared in the background when "More filters" opens
+function prepareFieldTexts() {
+  const book = state.book;
+  inBackground(book.spells, (entry) => { for (const field of SHEET_FIELDS) fieldText(entry.spell, field); }, () => state.book === book);
+}
+
+function matchesField(spell, field, words) {
+  if (field === "any") return anyFieldMatches(spell, words);
+  if (!FIELDS_NEEDING_TEXTS.includes(field)) return hasWords(fieldText(spell, field), words);
+  if (!spellTexts.map) return true; // still loading (or failed: the panel says so)
+  const texts = spellTexts.map.get(spell.id);
+  if (!texts) return false;
+  if (field === "description") return hasWords(texts.normal ??= normalText(texts.description), words);
+  return levelItems(spell, texts).some((item) => hasWords(item, words));
+}
+
+function fieldFilterCount() {
+  return Object.values(state.fieldFilters).filter((text) => wordsOf(text).length).length + Object.keys(state.componentFilters).length;
+}
+
 function filtersActive() {
-  return Boolean(state.textFilter.trim() || state.schoolFilters.size || state.onlyFavorites
-    || (state.book?.all && state.bookFilters.size));
+  return Boolean(wordsOf(state.textFilter).length || state.schoolFilters.size || state.onlyFavorites
+    || (state.book?.all && state.bookFilters.size) || fieldFilterCount());
 }
 
 function filteredSpells() {
@@ -574,29 +985,75 @@ function filterBar() {
   const onlyPrepared = state.view === "prepared" && viewClasses().some((c) => c.casting === "prepared");
   const placeholder = state.view === "prepared" ? "Search these spells…" : state.view === "scrolls" ? "Search these scrolls…"
     : book.all ? "Search all books…" : "Search this book…";
+  const rank = (code) => (COMPONENT_ORDER.includes(code) ? COMPONENT_ORDER.indexOf(code) : COMPONENT_ORDER.length);
+  const components = [...new Set([...book.spells.flatMap((v) => v.spell.components || []), ...Object.keys(state.componentFilters)])]
+    .sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
+  const count = fieldFilterCount();
+  const field = ([key, label, example]) => `
+    <label class="${WIDE_FIELDS.includes(key) ? "wide" : ""}">${label}<input type="search" data-field="${key}"
+      value="${esc(state.fieldFilters[key] || "")}" placeholder="e.g. ${esc(example)}" autocomplete="off" spellcheck="false" enterkeyhint="search"></label>`;
   return `
     <div class="toolbar" id="filter-bar">
       <div class="toolbar-row">
-        <input class="search" id="search" type="search" placeholder="${placeholder}${TOUCH ? "" : "  (/)"}" value="${esc(state.textFilter)}" aria-label="Search">
+        <input class="search" id="search" type="search" placeholder="${placeholder}${TOUCH ? "" : "  (/)"}" value="${esc(state.textFilter)}" aria-label="Search" enterkeyhint="search">
         <details class="level-menu" id="level-menu">
           <summary>Levels</summary>
           <div class="level-menu-panel" id="level-menu-panel"></div>
         </details>
+        <button type="button" class="more-filters-toggle" id="more-filters-toggle" aria-expanded="${state.moreFilters}" aria-controls="field-filters"
+          title="Filter by description, range, duration and the other fields of the sheet">${FUNNEL_ICON}<span class="wide-only-bar">More filters</span><span class="narrow-only-bar">Filters</span><span class="filter-count" id="field-filter-count" ${count ? "" : "hidden"}>${count}</span></button>
         ${canSelect() ? `<button type="button" class="select-toggle" id="select-toggle" aria-pressed="${state.selecting}"
           title="Pick several spells, to remove them together">${state.selecting ? "✓ Selecting" : "Select"}</button>` : ""}
       </div>
+      <div class="active-filters" id="active-filters" aria-label="Filters on" hidden></div>
+      <div class="field-filters-backdrop" id="field-filters-backdrop" ${state.moreFilters ? "" : "hidden"}></div>
+      <section class="field-filters" id="field-filters" aria-labelledby="field-filters-title" ${state.moreFilters ? "" : "hidden"}>
+        <header class="field-filters-head">
+          <span class="sheet-grip" aria-hidden="true"></span>
+          <h2 id="field-filters-title">More filters</h2>
+          <button type="button" class="field-filters-close" id="close-field-filters" aria-label="Close the filters">${CLOSE_ICON}</button>
+        </header>
+        <div class="field-filters-body">
+          <p class="field-filters-status" id="field-filters-status" role="status"></p>
+          ${FILTER_GROUPS.map(([group, title]) => `
+            <fieldset class="filter-group">
+              <legend>${title}</legend>
+              <div class="field-filter-grid">${FIELD_FILTERS.filter((f) => f[3] === group).map(field).join("")}</div>
+            </fieldset>`).join("")}
+          ${components.length ? `<fieldset class="filter-group">
+            <legend>Components</legend>
+            <div class="component-filters">${components.map((code) => `
+              <div class="tri" role="radiogroup" aria-label="${esc(COMPONENTS[code] ? `${COMPONENTS[code]} (${code})` : code)}">
+                <span class="tri-label"><abbr>${esc(code)}</abbr>${COMPONENTS[code] ? ` ${esc(code === "XP" ? "XP cost" : COMPONENTS[code])}` : ""}</span>
+                <span class="tri-options">${COMPONENT_CHOICES.map(([value, text]) => `<label><input type="radio" name="component-${esc(code)}" value="${value}"
+                  data-component="${esc(code)}" ${(state.componentFilters[code] || "") === value ? "checked" : ""}><span>${text}</span></label>`).join("")}</span>
+              </div>`).join("")}
+            </div>
+          </fieldset>` : ""}
+          <p class="field-filters-help">Every word you type must be in that field, in any order.</p>
+        </div>
+        <footer class="field-filters-foot">
+          <button type="button" class="button ghost" id="clear-field-filters">Clear these filters</button>
+          <button type="button" class="button gold" id="done-field-filters">Done</button>
+        </footer>
+      </section>
       <nav class="level-nav" id="level-nav" aria-label="Jump to level"></nav>
       ${books.length ? `<div class="book-filters" role="group" aria-label="Spellbooks">
         ${books.map((b) => `<button type="button" class="chip book-chip" data-book="${esc(b.id)}" aria-pressed="${state.bookFilters.has(b.id)}" style="--c:${COVERS[b.color] || COVERS.crimson}"><i></i>${esc(b.name)}</button>`).join("")}
       </div>` : ""}
       <div class="school-filters" role="group" aria-label="Quick filters and schools">
-        ${onlyPrepared ? `<button type="button" class="chip only-chip" data-only="prepared" aria-pressed="${state.onlyPrepared}"><i></i>✦ Only prepared</button>` : ""}
-        ${state.view === "scrolls" ? `<button type="button" class="chip only-chip" data-only="owned" aria-pressed="${state.onlyOwned}"><i></i>📜 Only owned</button>` : ""}
-        <button type="button" class="chip favorite-chip" data-favorites aria-pressed="${state.onlyFavorites}"><i></i>♥ Favorites</button>
+        ${onlyPrepared ? `<button type="button" class="chip only-chip" data-only="prepared" aria-pressed="${state.onlyPrepared}"><span class="chip-icon" aria-hidden="true">✦</span>Only prepared</button>` : ""}
+        ${state.view === "scrolls" ? `<button type="button" class="chip only-chip" data-only="owned" aria-pressed="${state.onlyOwned}"><span class="chip-icon" aria-hidden="true">📜</span>Only owned</button>` : ""}
+        <button type="button" class="chip favorite-chip" data-favorites aria-pressed="${state.onlyFavorites}"><span class="chip-icon" aria-hidden="true">♥</span>Favorites</button>
         ${schools.map((s) => `<button type="button" class="chip" data-school="${esc(s)}" aria-pressed="${state.schoolFilters.has(s)}" style="--c:${schoolColor({ school: s })}"><i></i>${esc(SCHOOLS[s] || s)}</button>`).join("")}
       </div>
     </div>`;
 }
+
+// Small icons drawn in SVG: fonts on phones don't always have ✕ or ⚙ in the text style
+const FUNNEL_ICON = `<svg class="funnel" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 5h17l-6.6 7.6v5.6l-3.8 1.9v-7.5z"/></svg>`;
+const CLOSE_ICON = `<svg class="x-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>`;
+const GEAR_ICON = `<svg class="gear-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
 
 // Draws the open tab again (after a filter or a fold changes)
 function renderView() {
@@ -607,16 +1064,31 @@ function renderView() {
 
 function bindFilterBar() {
   const bar = $("#filter-bar");
-  let typing = null;
   $("#search").addEventListener("input", (event) => {
     state.textFilter = event.target.value;
-    clearTimeout(typing);
-    // with a big book, the lists are drawn again when the typing pauses
-    if (state.book.spells.length > 300) typing = setTimeout(renderView, 150);
-    else renderView();
+    refilterSoon();
+  });
+  bar.addEventListener("input", (event) => {
+    const field = event.target.dataset.field;
+    if (!field) return;
+    if (event.target.value) state.fieldFilters[field] = event.target.value;
+    else delete state.fieldFilters[field];
+    if (FIELDS_NEEDING_TEXTS.includes(field)) loadSpellTexts();
+    refilterSoon();
   });
   bar.addEventListener("click", (event) => {
     if (event.target.closest("#select-toggle")) return setSelecting(!state.selecting);
+    if (event.target.closest("#more-filters-toggle")) return setMoreFilters(!state.moreFilters);
+    if (event.target.closest("#close-field-filters, #done-field-filters, #field-filters-backdrop")) return setMoreFilters(false);
+    if (event.target.closest("#retry-texts")) return loadSpellTexts();
+    if (event.target.closest("#clear-field-filters")) {
+      state.fieldFilters = {};
+      state.componentFilters = {};
+      syncFilterControls();
+      return refilter();
+    }
+    const pill = event.target.closest("[data-remove-filter]");
+    if (pill) return removeFilter(pill.dataset.removeFilter);
     const chip = event.target.closest(".chip");
     if (chip) {
       const d = chip.dataset;
@@ -631,7 +1103,7 @@ function bindFilterBar() {
         pressed = set.has(value);
       }
       chip.setAttribute("aria-pressed", pressed);
-      return renderView();
+      return refilter();
     }
     if (event.target.closest("[data-fold-all]")) return setFolded(Array.from({ length: 10 }, (_, n) => n), true);
     if (event.target.closest("[data-unfold-all]")) return setFolded(Array.from({ length: 10 }, (_, n) => n), false);
@@ -644,7 +1116,101 @@ function bindFilterBar() {
   bar.addEventListener("change", (event) => {
     const box = event.target.closest("[data-fold-level]");
     if (box) setFolded([Number(box.dataset.foldLevel)], !box.checked);
+    const component = event.target.dataset.component;
+    if (component && event.target.checked) {
+      if (event.target.value) state.componentFilters[component] = event.target.value;
+      else delete state.componentFilters[component];
+      refilter();
+    }
   });
+  if (state.moreFilters || usesSpellTexts()) loadSpellTexts();
+  if (state.moreFilters) prepareFieldTexts();
+  setMoreFilters(state.moreFilters);
+  updateFieldFilterStatus();
+}
+
+// "More filters" stay applied when the panel is closed: the button counts them. On a phone the panel is a sheet
+// over the page (app.css), which doesn't scroll behind it.
+function setMoreFilters(open) {
+  state.moreFilters = open;
+  $("#field-filters").hidden = !open;
+  $("#field-filters-backdrop").hidden = !open;
+  $("#more-filters-toggle").setAttribute("aria-expanded", open);
+  document.documentElement.classList.toggle("sheet-open", open && PHONE.matches);
+  if (open) {
+    loadSpellTexts();
+    prepareFieldTexts();
+  }
+}
+
+// The filters on, as pills that remove them (the search text is in its field), the count on the "Filters" button and
+// the number of spells on the panel's button. After every filter change.
+function updateActiveFilters() {
+  const box = $("#active-filters");
+  if (!box) return;
+  const pills = [];
+  const onlyPrepared = state.view === "prepared" && viewClasses().some((c) => c.casting === "prepared");
+  if (onlyPrepared && state.onlyPrepared) pills.push(["only:prepared", "✦ Only prepared"]);
+  if (state.view === "scrolls" && state.onlyOwned) pills.push(["only:owned", "📜 Only owned"]);
+  if (state.onlyFavorites) pills.push(["favorites", "♥ Favorites"]);
+  if (state.book.all) for (const id of state.bookFilters) pills.push([`book:${id}`, state.book.books.find((b) => b.id === id)?.name || id]);
+  for (const name of state.schoolFilters) pills.push([`school:${name}`, SCHOOLS[name] || name]);
+  for (const [key, label] of FIELD_FILTERS) {
+    const text = state.fieldFilters[key];
+    if (text && wordsOf(text).length) pills.push([`field:${key}`, `${label}: ${text.trim()}`]);
+  }
+  for (const [code, wanted] of Object.entries(state.componentFilters)) {
+    pills.push([`component:${code}`, `${wanted === "with" ? "With" : "Without"} ${COMPONENTS[code] ? `${COMPONENTS[code].toLowerCase()} (${code})` : code}`]);
+  }
+  box.hidden = !pills.length;
+  box.innerHTML = pills.map(([key, text]) => `<button type="button" class="filter-pill" data-remove-filter="${esc(key)}"
+      aria-label="Remove the filter ${esc(text)}"><span>${esc(text)}</span><span class="pill-x">${CLOSE_ICON}</span></button>`).join("")
+    + (pills.length > 1 ? `<button type="button" class="link clear-all-filters" data-remove-filter="all">Clear all</button>` : "");
+  const count = fieldFilterCount();
+  const badge = $("#field-filter-count");
+  badge.hidden = !count;
+  badge.textContent = count;
+  const shown = levelSections(viewContainer()).reduce((total, section) => total + Number(section.dataset.count || 0), 0);
+  $("#done-field-filters").textContent = filtersActive() ? `Show ${plural(shown, state.view === "scrolls" ? "scroll row" : "spell")}` : "Done";
+}
+
+function removeFilter(key) {
+  const split = key.indexOf(":");
+  const kind = split < 0 ? key : key.slice(0, split);
+  const value = key.slice(split + 1);
+  if (key === "all") {
+    Object.assign(state, { onlyPrepared: false, onlyOwned: false, onlyFavorites: false, fieldFilters: {}, componentFilters: {} });
+    state.schoolFilters.clear();
+    state.bookFilters.clear();
+  } else if (key === "favorites") state.onlyFavorites = false;
+  else if (kind === "only") state[value === "prepared" ? "onlyPrepared" : "onlyOwned"] = false;
+  else if (kind === "book") state.bookFilters.delete(value);
+  else if (kind === "school") state.schoolFilters.delete(value);
+  else if (kind === "field") delete state.fieldFilters[value];
+  else if (kind === "component") delete state.componentFilters[value];
+  syncFilterControls();
+  refilter();
+}
+
+// The chips, fields and component choices of the bar, from the state (after a pill or "Clear" removed filters)
+function syncFilterControls() {
+  const bar = $("#filter-bar");
+  for (const chip of bar.querySelectorAll(".chip")) {
+    const d = chip.dataset;
+    const pressed = "favorites" in d ? state.onlyFavorites : d.only === "prepared" ? state.onlyPrepared : d.only === "owned" ? state.onlyOwned
+      : d.school ? state.schoolFilters.has(d.school) : state.bookFilters.has(d.book);
+    chip.setAttribute("aria-pressed", pressed);
+  }
+  for (const input of bar.querySelectorAll("[data-field]")) input.value = state.fieldFilters[input.dataset.field] || "";
+  for (const radio of bar.querySelectorAll("[data-component]")) radio.checked = (state.componentFilters[radio.dataset.component] || "") === radio.value;
+}
+
+function updateFieldFilterStatus() {
+  const status = $("#field-filters-status");
+  if (!status) return;
+  status.innerHTML = spellTexts.error ? `The descriptions couldn't be loaded (${esc(spellTexts.error)}), so the Description and
+      class level filters aren't applied. <button type="button" class="link" id="retry-texts">Try again</button>`
+    : spellTexts.loading && !spellTexts.map ? "Loading the descriptions…" : "";
 }
 
 // ---------- levels: jump and fold (the same in the three tabs) ----------
@@ -676,18 +1242,43 @@ function setFolded(levels, fold) {
     button.setAttribute("aria-label", `${closed ? "Unfold" : "Fold"} ${title}`);
     button.title = `${closed ? "Unfold" : "Fold"} this level`;
   }
+  for (const box of sectionContainers) if (container?.contains(box)) fillNearBlocks(box); // unfolded rows
   updateLevelTools();
 }
 
 function jumpToLevel(level) {
-  const section = viewContainer()?.querySelector(`[data-level-section="${level}"]`);
+  const section = levelSections(viewContainer()).find((s) => s.dataset.levelSection === String(level));
   if (!section) return;
   if (isFolded(level)) setFolded([level], false);
-  // below the top bar, and below the filter bar when it stays at the top of the screen
+  scrollToSection(section);
+}
+
+// Brings a section (a level, a class block) to the top of the screen, below the top bar and the filter bar when it
+// stays at the top. In a big list the blocks above it may be empty with a guessed height: a smooth scroll would
+// fill them on the way and move the section, so it jumps there, fills the blocks around it and corrects.
+function scrollToSection(section) {
   const bar = $("#filter-bar");
   const style = bar && getComputedStyle(bar);
   const covered = style?.position === "sticky" ? parseFloat(style.top) + bar.offsetHeight : ($(".topbar")?.offsetHeight || 0);
-  window.scrollTo({ top: section.getBoundingClientRect().top + window.scrollY - covered - 8, behavior: "smooth" });
+  const top = () => section.getBoundingClientRect().top + window.scrollY - covered - 8;
+  const view = viewContainer();
+  if (!view || [...view.querySelectorAll(".row-block")].every((block) => blockState.get(block)?.live)) {
+    window.scrollTo({ top: top(), behavior: "smooth" });
+    return;
+  }
+  for (let i = 0; i < 3; i++) {
+    window.scrollTo({ top: top(), behavior: "instant" });
+    for (const box of sectionContainers) if (view.contains(box)) fillNearBlocks(box);
+  }
+  // the rows that come on screen get their real height only when the browser draws them: corrected after that
+  let tries = 0;
+  const settle = () => {
+    const off = top() - window.scrollY;
+    if (Math.abs(off) < 2 || tries++ >= 3) return;
+    window.scrollTo({ top: top(), behavior: "instant" });
+    requestAnimationFrame(() => requestAnimationFrame(settle));
+  };
+  requestAnimationFrame(() => requestAnimationFrame(settle));
 }
 
 // Jump links and the "Levels" menu, from the level sections on the page
@@ -697,7 +1288,7 @@ function updateLevelTools() {
   const panel = $("#level-menu-panel");
   if (!nav || !panel) return;
   const levels = new Map();
-  for (const section of container?.querySelectorAll("[data-level-section]") || []) {
+  for (const section of levelSections(container)) {
     const n = Number(section.dataset.levelSection);
     const info = levels.get(n) || { titles: new Set(), count: 0 };
     info.titles.add(section.querySelector("h2")?.textContent.trim());
@@ -769,8 +1360,8 @@ function renderBook() {
       </div>
       <div class="book-actions">
         ${book.unavailable ? "" : `<button class="button gold" id="open-add" type="button">✚ Add spell</button>
-        <button class="button" id="open-finder" type="button">🔍 Search dndtools</button>`}
-        <button class="button" id="book-settings" type="button">Settings</button>
+        <button class="button" id="open-finder" type="button" aria-label="Search dndtools">🔍 Search<span class="wide-only-bar">dndtools</span></button>`}
+        <button class="button" id="book-settings" type="button" aria-label="Settings" title="Settings">${GEAR_ICON}<span class="wide-only-bar">Settings</span></button>
       </div>
     </section>`;
 
@@ -778,7 +1369,7 @@ function renderBook() {
   // that changed are redrawn and the page doesn't jump
   const pageKey = `${book.all ? `all:${pc.id}` : book.id}|${state.view}`;
   const kept = app.dataset.page === pageKey ? app.querySelector("[data-view-body]") : null;
-  const search = kept && document.activeElement?.id === "search" ? document.activeElement : null;
+  const typing = kept && document.activeElement?.matches("#filter-bar input") ? document.activeElement : null;
   const scrolled = window.scrollY;
   app.dataset.page = pageKey;
   app.innerHTML = `
@@ -806,15 +1397,17 @@ function renderBook() {
   $("#book-settings")?.addEventListener("click", () => openBookDialog(book));
   bindFilterBar();
   renderView();
-  if (search) {
-    const field = $("#search");
+  updateActiveFilters();
+  if (typing) {
+    const field = $(typing.dataset.field ? `#filter-bar [data-field="${typing.dataset.field}"]` : "#search");
     field.focus({ preventScroll: true });
-    field.setSelectionRange(search.selectionStart, search.selectionEnd);
+    field.setSelectionRange(typing.selectionStart, typing.selectionEnd);
   }
   if (kept && window.scrollY !== scrolled) window.scrollTo(0, scrolled);
 }
 
 function renderPages() {
+  if (!filterPass) listGen++;
   const container = $("#book-pages");
   const book = state.book;
   const entries = filteredSpells();
@@ -845,13 +1438,20 @@ function renderPages() {
     container.querySelector("[data-action]")?.addEventListener("click", openAddDialog);
     return finish();
   }
-  if (!entries.length) {
-    container.innerHTML = `<div class="empty"><div class="big">No spells found</div><p>Try a different search, or turn off some of the filters above.</p></div>`;
-    return finish();
-  }
-
-  patchSections(container, [...byLevel.keys()].sort((a, b) => a - b).map((level) => {
-    const group = byLevel.get(level);
+  // every level stays on the page: a filter hides the levels it empties and shows the others' matching cards in a
+  // list of their own, while the whole list waits hidden (see patchSections). Rows and `all` share the lazy rows.
+  const row = (entry) => cachedRow(entry, entry.spell.id, () => spellCard(entry));
+  const { allByLevel, allRows } = fromData("book", () => {
+    const grouped = new Map();
+    for (const entry of book.spells) {
+      if (!grouped.has(entry.level)) grouped.set(entry.level, []);
+      grouped.get(entry.level).push(entry);
+    }
+    return { allByLevel: grouped, allRows: new Map([...grouped].map(([level, group]) => [level, group.map(row)])) };
+  });
+  const sections = [...allByLevel.keys()].sort((a, b) => a - b).map((level) => {
+    const group = byLevel.get(level) || [];
+    const all = allByLevel.get(level);
     const pageCount = group.reduce((total, v) => total + pages(v.level), 0);
     const title = levelTitle(level, book.all ? null : classByKey(book.class_key));
     return {
@@ -869,9 +1469,15 @@ function renderPages() {
             <input type="checkbox" data-select-level="${level}"> <span><span class="wide-only-select">Select </span>all</span></label>` : ""}
         </div>`,
       listTag: "div", listClass: "spell-grid",
-      rows: group.map((entry) => lazyRow(entry.spell.id, () => spellCard(entry))),
+      rows: group.length === all.length ? allRows.get(level) : group.map(row),
+      hidden: !group.length,
     };
-  }), decorateCard);
+  });
+  if (!entries.length) {
+    sections.push({ key: "none", className: "no-results", rows: [],
+      head: `<div class="empty"><div class="big">No spells found</div><p>Try a different search, or turn off some of the filters above.</p></div>` });
+  }
+  patchSections(container, sections, decorateCard);
   finish();
 }
 
@@ -926,7 +1532,7 @@ function syncSelection() {
       for (const card of container.querySelectorAll(".card")) decorateCard(card);
       container.dataset.marked = on ? "1" : "";
     }
-    for (const box of container.querySelectorAll("[data-select-level]")) {
+    for (const box of on ? container.querySelectorAll("[data-select-level]") : []) {
       const ids = state.selectionLevels.get(Number(box.dataset.selectLevel)) || [];
       const picked = ids.filter((id) => state.selected.has(id)).length;
       box.checked = ids.length > 0 && picked === ids.length;
@@ -1090,8 +1696,7 @@ function spellCard(entry) {
         ${scrollCount(inc.id) ? `<span class="scroll-badge" title="Scrolls">📜 ${scrollCount(inc.id)}</span>` : ""}
         ${forbidden ? `<span class="forbidden-badge">Forbidden</span>` : ""}
         <span class="spacer"></span>
-        <span>${esc(shortSource(inc))}</span>
-        <span>· ${pages(entry.level)} pg.</span>
+        <span class="card-source">${esc(shortSource(inc))} <span class="card-pages">· ${pages(entry.level)} pg.</span></span>
       </div>
     </button>`;
 }
@@ -1616,6 +2221,7 @@ function classBlockSkeleton(cls) {
 }
 
 function renderPreparation() {
+  if (!filterPass) listGen++;
   const container = $("#preparation");
   if (!container) return;
   const pc = state.character;
@@ -1655,7 +2261,7 @@ function renderPreparation() {
 
 function renderClassBlock(block, cls) {
   const spontaneous = cls.casting === "spontaneous";
-  const levels = spontaneous ? castingLevels(cls) : preparationLevels(cls);
+  const levels = fromData(`levels:${cls.key}`, () => (spontaneous ? castingLevels(cls) : preparationLevels(cls)));
   const score = cls.ability_score;
   block.querySelector("[data-ability-mod]").textContent = score ? `mod ${signed(modifier(score))}` : "not set";
   const specType = block.querySelector("[data-spec-type]");
@@ -1706,23 +2312,30 @@ function renderClassBlock(block, cls) {
   });
   const sections = levels
     .filter((l) => l.rows.length || l.slot)
-    .map((l) => (spontaneous ? castingSection(l, cls) : preparationSection(l, cls)))
-    .filter(Boolean);
+    .map((l) => (spontaneous ? castingSection(l, cls) : preparationSection(l, cls)));
   const filtered = filtersActive() || (!spontaneous && state.onlyPrepared);
   const container = block.querySelector("[data-class-sections]");
-  if (sections.length) patchSections(container, sections);
+  if (sections.length) patchSections(container, withNothingMatches(sections));
   else container.innerHTML = `<p class="empty-level">${filtered ? "Nothing matches the filters above." : `No ${esc(cls.name)} spells ${state.book.all ? "in your books" : "in this book"} yet, and no spells per day written above.`}</p>`;
 }
 
-// A level of a class that prepares its spells: {head, rows} for patchSections, or null when filtered away
+// When a filter hid every level: the message, as one more section (the hidden ones stay on the page)
+function withNothingMatches(sections) {
+  if (!sections.every((section) => section.hidden)) return sections;
+  return [...sections, { key: "none", className: "no-results", rows: [], head: `<p class="empty-level">Nothing matches the filters above.</p>` }];
+}
+
+// A level of a class that prepares its spells: {head, rows, all, hidden} for patchSections (hidden when filtered away)
 function preparationSection(l, cls) {
+  const lazy = fromData(`rows:${cls.key}:${l.n}`, () => new Map(l.rows.map((r) => [r, lazyRow(r.key, () => preparationRow(r, cls))])));
+  const everyRow = fromData(`all:${cls.key}:${l.n}`, () => l.rows.map((r) => lazy.get(r)));
   const rows = l.rows.filter((r) => (!state.onlyPrepared || r.copies) && matchesFilters(r.entry.spell, r.entry.books));
-  if ((state.onlyPrepared || filtersActive()) && !rows.length) return null;
   const title = levelTitle(l.n, cls);
   return {
     key: `level-${l.n}`, level: l.n, className: `prep-level${isFolded(l.n) ? " folded" : ""}`,
     listTag: "ul", listClass: "prep-list",
-    rows: rows.map((r) => lazyRow(r.key, () => preparationRow(r, cls))),
+    rows: rows.length === l.rows.length ? everyRow : rows.map((r) => lazy.get(r)),
+    hidden: (state.onlyPrepared || filtersActive()) && !rows.length,
     empty: `<p class="empty-level">No spells of this level in ${state.book.all ? "your books" : "this book"} yet.</p>`,
     head: `
       <div class="level-title">
@@ -1742,8 +2355,9 @@ function preparationSection(l, cls) {
 }
 
 function castingSection(l, cls) {
+  const lazy = fromData(`rows:${cls.key}:${l.n}`, () => new Map(l.rows.map((r) => [r, lazyRow(r.entry.spell.id, () => castingRow(r, l, cls))])));
+  const everyRow = fromData(`all:${cls.key}:${l.n}`, () => l.rows.map((r) => lazy.get(r)));
   const rows = l.rows.filter((r) => matchesFilters(r.entry.spell, r.entry.books));
-  if (filtersActive() && !rows.length) return null;
   const left = Math.max(0, l.slot - l.used);
   const title = levelTitle(l.n, cls);
   const pips = Array.from({ length: l.slot }, (_, i) => `
@@ -1752,7 +2366,8 @@ function castingSection(l, cls) {
   return {
     key: `level-${l.n}`, level: l.n, className: `prep-level${isFolded(l.n) ? " folded" : ""}`,
     listTag: "ul", listClass: "prep-list",
-    rows: rows.map((r) => lazyRow(r.entry.spell.id, () => castingRow(r, l, cls))),
+    rows: rows.length === l.rows.length ? everyRow : rows.map((r) => lazy.get(r)),
+    hidden: filtersActive() && !rows.length,
     empty: `<p class="empty-level">No spells of this level known ${state.book.all ? "in your books" : "in this book"}.</p>`,
     head: `
       <div class="level-title">
@@ -2044,7 +2659,8 @@ function saveSlots(block, cls) {
 }
 
 function jumpTo(id) {
-  document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
+  const target = document.getElementById(id);
+  if (target) scrollToSection(target);
 }
 
 app.addEventListener("click", async (event) => {
@@ -2274,25 +2890,35 @@ function scrollRow({ entry, count, price }, cls) {
 }
 
 // The level sections of a class in the Scrolls tab, for patchSections
+// Every level of the class's spells (hidden when a filter empties it), with the whole list in `all`
 function scrollSections(cls) {
-  const visible = visibleSpellIds();
-  const byLevel = new Map();
-  for (const entry of classEntries(cls)) {
-    if (visible && !visible.has(entry.spell.id)) continue;
-    const count = scrollCount(entry.spell.id, cls);
-    if ((state.onlyOwned && !count) || !matchesFilters(entry.spell, entry.books)) continue;
-    if (!byLevel.has(entry.level)) byLevel.set(entry.level, []);
-    byLevel.get(entry.level).push({ entry, count, price: scrollPrice(entry.level, entry.spell, cls) });
-  }
+  const byLevel = fromData(`scrolls:${cls.key}`, () => {
+    const visible = visibleSpellIds();
+    const grouped = new Map();
+    for (const entry of classEntries(cls)) {
+      if (visible && !visible.has(entry.spell.id)) continue;
+      if (!grouped.has(entry.level)) grouped.set(entry.level, []);
+      grouped.get(entry.level).push({ entry, count: scrollCount(entry.spell.id, cls), price: scrollPrice(entry.level, entry.spell, cls) });
+    }
+    for (const group of grouped.values()) group.sort((a, b) => favoritesFirst(a.entry.spell, b.entry.spell));
+    return grouped;
+  });
+  const filtering = state.onlyOwned || filtersActive();
   return [...byLevel.keys()].sort((a, b) => a - b).map((level) => {
-    const rows = byLevel.get(level).sort((a, b) => favoritesFirst(a.entry.spell, b.entry.spell));
+    const everyRow = byLevel.get(level);
+    const lazy = fromData(`scroll-rows:${cls.key}:${level}`, () => new Map(everyRow.map((row) => [row, lazyRow(row.entry.spell.id, () => scrollRow(row, cls))])));
+    const allRows = fromData(`scroll-all:${cls.key}:${level}`, () => everyRow.map((row) => lazy.get(row)));
+    const rows = filtering
+      ? everyRow.filter((row) => !(state.onlyOwned && !row.count) && matchesFilters(row.entry.spell, row.entry.books))
+      : everyRow;
     const owned = rows.reduce((total, row) => total + row.count, 0);
     const casterLevel = scrollCasterLevel(level, cls);
     const title = levelTitle(level, cls);
     return {
       key: `level-${level}`, level, className: `prep-level${isFolded(level) ? " folded" : ""}`,
       listTag: "ul", listClass: "prep-list",
-      rows: rows.map((row) => lazyRow(row.entry.spell.id, () => scrollRow(row, cls))),
+      rows: rows.length === everyRow.length ? allRows : rows.map((row) => lazy.get(row)),
+      hidden: !rows.length,
       empty: "",
       head: `
         <div class="level-title">
@@ -2310,6 +2936,7 @@ function scrollSections(cls) {
 
 // Like the prepared spells: one block per class, one section per level, the rows of the open book (or of all the books)
 function renderScrolls() {
+  if (!filterPass) listGen++;
   const container = $("#scrolls");
   if (!container) return;
   const classes = viewClasses();
@@ -2350,7 +2977,7 @@ function renderScrolls() {
   for (const cls of classes) {
     const box = container.querySelector(`[data-class-block="${CSS.escape(cls.key)}"] [data-class-sections]`);
     const sections = scrollSections(cls);
-    if (sections.length) patchSections(box, sections);
+    if (sections.length) patchSections(box, withNothingMatches(sections));
     else box.innerHTML = `<p class="empty-level">${filtered ? "Nothing matches the filters above." : `No ${esc(cls.name)} spells ${state.book.all ? "in your books" : "in this book"} yet.`}</p>`;
   }
   updateLevelTools();
@@ -2390,21 +3017,31 @@ function cartKey(cls, id) {
   return `${cls.key}|${id}`;
 }
 
-// Every spell that can get a scroll on this page (all classes shown, whatever the filters of the dialog)
+// Every spell that can get a scroll on this page (all classes shown, whatever the filters of the dialog), with its
+// prices: worked out once until the data changes (thousands of spells), not at every click in the dialog
 function cartItems() {
-  const visible = visibleSpellIds();
-  const items = new Map();
-  for (const cls of viewClasses()) {
-    for (const entry of classEntries(cls)) {
-      if (visible && !visible.has(entry.spell.id)) continue;
-      items.set(cartKey(cls, entry.spell.id), {
-        key: cartKey(cls, entry.spell.id), cls, entry,
-        price: scrollPrice(entry.level, entry.spell, cls),
-        owned: scrollCount(entry.spell.id, cls),
-      });
+  return fromData("cart-items", () => {
+    const visible = visibleSpellIds();
+    const items = new Map();
+    for (const cls of viewClasses()) {
+      for (const entry of classEntries(cls)) {
+        if (visible && !visible.has(entry.spell.id)) continue;
+        items.set(cartKey(cls, entry.spell.id), {
+          key: cartKey(cls, entry.spell.id), cls, entry,
+          price: scrollPrice(entry.level, entry.spell, cls),
+          owned: scrollCount(entry.spell.id, cls),
+          words: normalText(entry.spell.name, school(entry.spell), cls.name),
+        });
+      }
     }
-  }
-  return items;
+    return items;
+  });
+}
+
+// The same, in the order of the list: by level, favorites first
+function cartOrder() {
+  return fromData("cart-order", () => [...cartItems().values()]
+    .sort((a, b) => a.entry.level - b.entry.level || favoritesFirst(a.entry.spell, b.entry.spell) || a.cls.name.localeCompare(b.cls.name)));
 }
 
 function amount(value) {
@@ -2474,7 +3111,7 @@ function openCart() {
       </select>` : ""}
       <label class="cart-only"><input type="checkbox" id="cart-only" ${cart.onlyChosen ? "checked" : ""}> Only the chosen ones</label>
     </div>
-    <ul class="cart-list" id="cart-list"></ul>
+    <div class="cart-rows" id="cart-list"></div>
     <div class="cart-footer">
       <div class="cart-summary" id="cart-summary" aria-live="polite"></div>
       <div class="form-actions">
@@ -2484,54 +3121,65 @@ function openCart() {
         <button type="button" class="button gold" id="cart-add" disabled>Add scrolls</button>
       </div>
     </div>`;
-  renderCart();
+  // open first: the list fills the part of the dialog that shows
   const dialog = $("#cart-dialog");
   if (!dialog.open) dialog.showModal();
   dialog.scrollTop = 0;
+  renderCart();
   if (!TOUCH) $("#cart-budget").focus();
 }
 
+// The rows depend on what is chosen and on the gold left ("Max"): every drawing is a new generation, so rows are
+// compared by their HTML. Only the rows near the visible part of the dialog are built (see patchList).
+let cartGen = 0;
+
 function renderCart() {
+  cartGen++;
   const items = cartItems();
-  const text = cart.text.trim().toLowerCase();
+  const words = wordsOf(cart.text);
   const multi = viewClasses().length > 1;
   const totals = cartTotals(items);
-  const shown = [...items.values()]
+  const shown = cartOrder()
     .filter((i) => (!cart.cls || i.cls.key === cart.cls) && (cart.level === "" || i.entry.level === Number(cart.level)))
     .filter((i) => !cart.onlyChosen || cart.counts.get(i.key))
-    .filter((i) => !text || [i.entry.spell.name, school(i.entry.spell), i.cls.name].join(" ").toLowerCase().includes(text))
-    .sort((a, b) => a.entry.level - b.entry.level || favoritesFirst(a.entry.spell, b.entry.spell) || a.cls.name.localeCompare(b.cls.name));
-  $("#cart-list").innerHTML = shown.map((i) => {
-    const n = cart.counts.get(i.key) || 0;
-    const p = i.price;
-    const plus = p.costs.variable ? "+" : "";
-    const blocked = cartBlocked(i);
-    const room = 99 - i.owned - n;  // a spell can have at most 99 scrolls
-    const unit = cart.mode === "buy" ? p.market : p.scribeGp;
-    const canMax = !blocked && room > 0 && totals.goldLeft !== null && unit > 0 && maxMore(i, totals) > 0;
-    return `
-      <li class="cart-row ${n ? "chosen" : ""} ${blocked ? "blocked" : ""}" style="--c:${schoolColor(i.entry.spell)}">
-        <div class="cart-info">
-          <span class="cart-name"><button type="button" class="ref" data-cart-open="${esc(i.entry.spell.id)}">${esc(i.entry.spell.name)}</button>
-            ${multi ? `<span class="finder-tag">${esc(i.cls.name)}</span>` : ""}${isFavorite(i.entry.spell.id) ? ` <span class="favorite-mark" title="Favorite">♥</span>` : ""}</span>
-          <span class="cart-meta">${esc(levelTitle(i.entry.level, i.cls))} · caster level ${p.casterLevel}${i.owned ? ` · you have ${i.owned}` : ""}</span>
-          <span class="cart-prices"><span class="${cart.mode === "buy" ? "current" : ""}">buy ${esc(coins(p.market))}${plus}</span>
-            <span class="${cart.mode === "scribe" ? "current" : ""}">scribe ${esc(coins(p.scribeGp))}${plus} + ${p.scribeXp.toLocaleString("en-US")} XP</span></span>
-          ${forbiddenSchool(i.entry.spell, i.cls) ? `<span class="cart-note">${esc(forbiddenSchool(i.entry.spell, i.cls))} is a forbidden school: you can buy the scroll but not use or scribe it.</span>`
-            : blocked ? `<span class="cart-note">Its spellbook is not available: it can be bought, not scribed.</span>` : ""}
-        </div>
-        <div class="cart-controls">
-          ${n ? `<span class="cart-line">${n} × = <b>${esc(coins(n * unit))}${plus}</b>${cart.mode === "scribe" ? ` + ${(n * p.scribeXp).toLocaleString("en-US")} XP` : ""}</span>` : ""}
-          ${canMax ? `<button type="button" class="button compact" data-cart-max="${esc(i.key)}" title="As many as the gold left allows">Max</button>` : ""}
-          <div class="stepper">
-            <button type="button" data-cart-change="-1" data-key="${esc(i.key)}" aria-label="One scroll of ${esc(i.entry.spell.name)} less" ${n ? "" : "disabled"}>−</button>
-            <span class="copies" aria-live="polite">${n}</span>
-            <button type="button" data-cart-change="1" data-key="${esc(i.key)}" aria-label="One more scroll of ${esc(i.entry.spell.name)}" ${blocked || room <= 0 ? "disabled" : ""}>+</button>
-          </div>
-        </div>
-      </li>`;
-  }).join("") || `<li class="finder-none">${items.size ? "No spells match." : "No spells in this book yet."}</li>`;
+    .filter((i) => !words.length || hasWords(i.words, words));
+  patchSections($("#cart-list"), [{
+    key: "rows", className: "cart-section", head: "", listTag: "ul", listClass: "cart-list",
+    rows: shown.map((i) => lazyRow(i.key, () => cartRow(i, totals, multi))),
+    empty: `<p class="finder-none">${items.size ? "No spells match." : "No spells in this book yet."}</p>`,
+  }], null, { root: $("#cart-dialog"), gen: () => cartGen });
   renderCartSummary(totals);
+}
+
+function cartRow(i, totals, multi) {
+  const n = cart.counts.get(i.key) || 0;
+  const p = i.price;
+  const plus = p.costs.variable ? "+" : "";
+  const blocked = cartBlocked(i);
+  const room = 99 - i.owned - n;  // a spell can have at most 99 scrolls
+  const unit = cart.mode === "buy" ? p.market : p.scribeGp;
+  const canMax = !blocked && room > 0 && totals.goldLeft !== null && unit > 0 && maxMore(i, totals) > 0;
+  return `
+    <li class="cart-row ${n ? "chosen" : ""} ${blocked ? "blocked" : ""}" style="--c:${schoolColor(i.entry.spell)}">
+      <div class="cart-info">
+        <span class="cart-name"><button type="button" class="ref" data-cart-open="${esc(i.entry.spell.id)}">${esc(i.entry.spell.name)}</button>
+          ${multi ? `<span class="finder-tag">${esc(i.cls.name)}</span>` : ""}${isFavorite(i.entry.spell.id) ? ` <span class="favorite-mark" title="Favorite">♥</span>` : ""}</span>
+        <span class="cart-meta">${esc(levelTitle(i.entry.level, i.cls))} · caster level ${p.casterLevel}${i.owned ? ` · you have ${i.owned}` : ""}</span>
+        <span class="cart-prices"><span class="${cart.mode === "buy" ? "current" : ""}">buy ${esc(coins(p.market))}${plus}</span>
+          <span class="${cart.mode === "scribe" ? "current" : ""}">scribe ${esc(coins(p.scribeGp))}${plus} + ${p.scribeXp.toLocaleString("en-US")} XP</span></span>
+        ${forbiddenSchool(i.entry.spell, i.cls) ? `<span class="cart-note">${esc(forbiddenSchool(i.entry.spell, i.cls))} is a forbidden school: you can buy the scroll but not use or scribe it.</span>`
+          : blocked ? `<span class="cart-note">Its spellbook is not available: it can be bought, not scribed.</span>` : ""}
+      </div>
+      <div class="cart-controls">
+        ${n ? `<span class="cart-line">${n} × = <b>${esc(coins(n * unit))}${plus}</b>${cart.mode === "scribe" ? ` + ${(n * p.scribeXp).toLocaleString("en-US")} XP` : ""}</span>` : ""}
+        ${canMax ? `<button type="button" class="button compact" data-cart-max="${esc(i.key)}" title="As many as the gold left allows">Max</button>` : ""}
+        <div class="stepper">
+          <button type="button" data-cart-change="-1" data-key="${esc(i.key)}" aria-label="One scroll of ${esc(i.entry.spell.name)} less" ${n ? "" : "disabled"}>−</button>
+          <span class="copies" aria-live="polite">${n}</span>
+          <button type="button" data-cart-change="1" data-key="${esc(i.key)}" aria-label="One more scroll of ${esc(i.entry.spell.name)}" ${blocked || room <= 0 ? "disabled" : ""}>+</button>
+        </div>
+      </div>
+    </li>`;
 }
 
 // How many more scrolls of this spell the gold (and XP, when scribing) left can pay for
@@ -3412,7 +4060,7 @@ async function confirmAdd() {
     $("#add-dialog").close();
     await reloadView();
     notify(`${state.preview.spell.name} ${state.preview.removed_from_book ? "is back in" : "added to"} the book.`);
-    document.getElementById(`level-${level}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+    jumpTo(`level-${level}`);
   } catch (error) {
     $("#add-error").textContent = error.message;
     $("#add-error").hidden = false;
@@ -3857,6 +4505,8 @@ const FINDER_MULTI = ["spellclasslevel__level", "spelldomainlevel__level", "rule
 const finder = {
   options: null, results: [], selected: new Set(), searched: false, stopped: false, incomplete: false, busy: false, summary: "",
   jobId: null,
+  filters: {},      // the filters of the results shown
+  otherEditions: 0, // spells that match everything but the editions ticked
 };
 
 async function openFinder() {
@@ -3949,6 +4599,18 @@ function resetFinderForm() {
   }
 }
 
+// Puts the filters of a search back in the form (to widen the search of the results shown)
+function fillFinderForm(filters) {
+  const form = $("#finder-form");
+  form.reset();
+  for (const field of form.elements) {
+    if (!field.name) continue;
+    const value = filters[field.name];
+    if (field.type === "checkbox") field.checked = [].concat(value || []).includes(field.value);
+    else field.value = value || "";
+  }
+}
+
 function finderFilters() {
   const filters = {};
   for (const [key, value] of new FormData($("#finder-form"))) {
@@ -3964,7 +4626,7 @@ function optionLabel(name, value) {
 }
 
 async function runFinder(event) {
-  event.preventDefault();
+  event?.preventDefault();
   if (finder.busy) return;
   const filters = finderFilters();
   const out = $("#finder-results");
@@ -3995,6 +4657,7 @@ async function runFinder(event) {
 function applySearch(job, filters) {
   Object.assign(finder, {
     jobId: job.id, results: job.results || [], searched: true, stopped: job.stopped, incomplete: job.incomplete,
+    filters, otherEditions: job.other_editions || 0,
     className: optionLabel("class_levels__slug", filters.class_levels__slug),
     domainName: optionLabel("domain_levels__slug", filters.domain_levels__slug),
   });
@@ -4029,9 +4692,19 @@ function renderFinderResults() {
         </span>
       </label></li>`;
   }).join("");
+  // what the defaults left out (the book's class, the 3.5 editions), with a button to search again without it
+  const hints = [];
+  if (finder.otherEditions) {
+    hints.push(`<p class="finder-hint">${plural(finder.otherEditions, "more spell")} ${finder.otherEditions === 1 ? "matches" : "match"} in the editions that aren't ticked.
+      <button type="button" class="button" data-widen="editions">Include every edition</button></p>`);
+  }
+  if (!finder.results.length && !finder.otherEditions && finder.filters.class_levels__slug) {
+    hints.push(`<p class="finder-hint">Only the ${esc(finder.className)} spell lists were searched.
+      <button type="button" class="button" data-widen="class">Search every class</button></p>`);
+  }
   out.innerHTML = `
     ${finder.summary}
-    ${!finder.results.length ? (finder.searched ? `<p class="finder-none">No spells match these filters.</p>` : "") : `
+    ${!finder.results.length ? (finder.searched ? `<p class="finder-none">No spells match these filters.</p>${hints.join("")}` : "") : `
     <div class="finder-bar">
       <label class="finder-all"><input type="checkbox" id="finder-all"> Select all</label>
       <span class="finder-count" id="finder-count"></span>
@@ -4040,6 +4713,7 @@ function renderFinderResults() {
     </div>
     ${finder.stopped ? `<p class="parchment-warning">Search stopped: only the spells found until then are listed.</p>` : ""}
     ${finder.incomplete ? `<p class="parchment-warning">Some result pages could not be loaded from dndtools: search again to complete the list.</p>` : ""}
+    ${hints.join("")}
     <ul class="finder-list">${rows}</ul>`}`;
   updateFinderSelection();
 }
@@ -4213,7 +4887,7 @@ async function saveHandwritten(event) {
       await reloadView();
       const fresh = state.book.spells.find((v) => !before.has(v.spell.id));
       notify(`${sheet.name.trim()} added to the book.`);
-      if (fresh) document.getElementById(`level-${fresh.level}`)?.scrollIntoView({ behavior: "smooth", block: "start" });
+      if (fresh) jumpTo(`level-${fresh.level}`);
     }
   } catch (e) {
     error.textContent = e.message;
@@ -4550,7 +5224,14 @@ toTop.addEventListener("click", () => {
   toTop.blur();
 });
 
+PHONE.addEventListener("change", () => document.documentElement.classList.toggle("sheet-open", state.moreFilters && PHONE.matches && Boolean($("#field-filters"))));
+
 document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.moreFilters && $("#field-filters") && !document.querySelector("dialog[open]")) {
+    setMoreFilters(false);
+    $("#more-filters-toggle")?.focus();
+    return;
+  }
   const menu = $(".level-menu[open]");
   if (event.key === "Escape" && menu) {
     menu.open = false;
@@ -4648,6 +5329,19 @@ $("#finder").addEventListener("submit", (event) => {
 $("#finder").addEventListener("click", (event) => {
   if (event.target.closest("#finder-reset")) resetFinderForm();
   if (event.target.closest("#finder-add")) importFinderSelection();
+  const widen = event.target.closest("[data-widen]");
+  if (widen && !finder.busy) {
+    // the same search as the results shown, without that filter
+    const filters = { ...finder.filters };
+    if (widen.dataset.widen === "editions") {
+      delete filters.rulebook__dnd_edition__slug;
+    } else {
+      delete filters.class_levels__slug;
+      delete filters.spellclasslevel__level;
+    }
+    fillFinderForm(filters);
+    runFinder();
+  }
 });
 $("#finder").addEventListener("change", (event) => {
   const pick = event.target.dataset.pick;

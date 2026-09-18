@@ -23,9 +23,10 @@ from . import units
 
 USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64; rv:130.0) Gecko/20100101 Firefox/130.0"
 
+# A few slugs have capital letters (/spell-compendium--86/Solipism--4190/): dndtools serves them only that way
 URL_RE = re.compile(
     r"^https?://(?:www\.)?dndtools\.net/spells/"
-    r"(?P<rulebook>[a-z0-9-]+--\d+)/(?P<slug>[a-z0-9-]+)--(?P<id>\d+)/?(?:[?#].*)?$"
+    r"(?P<rulebook>[A-Za-z0-9-]+--\d+)/(?P<slug>[A-Za-z0-9-]+)--(?P<id>\d+)/?(?:[?#].*)?$"
 )
 
 # Stat labels on dndtools -> key in the JSON
@@ -50,7 +51,7 @@ LABEL_RE = re.compile(r"^(?:<[^>]+>)*[A-Z0-9][^.:<>]{0,45}:")
 
 # Link to another spell inside the description (relative or absolute)
 SPELL_LINK_RE = re.compile(
-    r"^(?:https?://(?:www\.)?dndtools\.net)?/spells/(?P<rulebook>[a-z0-9-]+--\d+)/(?P<slug>[a-z0-9-]+)--(?P<id>\d+)/?$")
+    r"^(?:https?://(?:www\.)?dndtools\.net)?/spells/(?P<rulebook>[A-Za-z0-9-]+--\d+)/(?P<slug>[A-Za-z0-9-]+)--(?P<id>\d+)/?$")
 # "This spell functions like <a>protection from evil</a>, except..."
 BASED_ON_RE = re.compile(
     r"(?:functions?|works?|operates?|is\s+(?:identical|similar))\s+(?:just\s+|exactly\s+|much\s+)?"
@@ -339,7 +340,7 @@ def parse_page(page_html, url):
             based_on, based_on_name = by_name[based_on_name.lower()], None
     if not based_on and not based_on_name and not stats and references:
         based_on = references[0]["id"]  # no stats of its own: they come from the first referenced spell
-    slug = re.search(r"/([a-z0-9-]+)--\d+/$", canonical).group(1)
+    slug = re.search(r"/([A-Za-z0-9-]+)--\d+/$", canonical).group(1)
 
     return units.convert_spell({
         "id": spell_id,

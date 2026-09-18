@@ -14,7 +14,7 @@ full spell is saved on your computer (with measurements in metric units).
 - **Preparing spells:** spells per day with ability bonuses, specialist schools, domains, forbidden schools and
   metamagic feats. Sorcerers and similar classes spend slots instead.
 - **Scrolls:** market price and scribing cost for each spell, and a planner that fits a batch of scrolls to your gold.
-- **Everyday tools:** favorites, filters, folding levels, removed spells you can restore, and books marked as lost or stolen.
+- **Everyday tools:** favorites, filters (by name, school, or any field of the sheet: description, range, duration…), folding levels, removed spells you can restore, and books marked as lost or stolen.
 - **Tidying up:** "Select" in a spellbook picks several spells at once (or a whole level) and removes them together, with Undo.
 - **Rules at hand:** the full text of every spell, with clickable conditions from the d20 SRD.
 - **Phone:** the layout works on phones, and a QR code opens the grimoire from any device on your Wi-Fi.

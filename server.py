@@ -767,6 +767,20 @@ def full_character(store, character_id):
     }
 
 
+def spell_texts(store, character_id):
+    """What the light sheets leave out and the "More filters" of the page search, for every spell shown in the
+    character's books: the description as plain text and the class levels ("Wizard 3")."""
+    store.character(character_id)  # 404 if it doesn't exist
+    texts = {}
+    for spell_id in character_spells(store.books_of(character_id)):
+        sheet = store.spell(spell_id)
+        if sheet:
+            description = html.unescape(re.sub(r"<[^>]+>", " ", sheet.get("description_html") or ""))
+            texts[spell_id] = {"description": re.sub(r"\s+", " ", description).strip(),
+                               "levels": [f"{l['caster_class']} {l['level']}" for l in sheet.get("levels") or []]}
+    return {"spells": texts}
+
+
 def clean_character(store, character_id):
     """After deleting a book or a spell for good (or moving a book to another character or class): drops the
     prepared spells, scrolls, favorites and ★ marks of spells that are no longer in a book of that class
@@ -1640,6 +1654,12 @@ def make_handler(store, network, control=None):
                             raise ApiError(HTTPStatus.CONFLICT, "This character still has spellbooks: move them to another character or delete them first.")
                         store.delete_character(parts[1])
                     return {"ok": True}
+            if len(parts) == 3 and parts[0] == "characters" and parts[2] == "texts" and method == "GET":
+                etag = self._data_etag()
+                if self.headers.get("If-None-Match") == etag:
+                    store.character(parts[1])
+                    return {}, HTTPStatus.OK, etag  # answered with 304
+                return spell_texts(store, parts[1]), HTTPStatus.OK, etag
             if len(parts) == 3 and parts[0] == "characters" and parts[2] == "prepared" and method == "PUT":
                 return self._prepare(parts[1], self._body())
             if len(parts) == 3 and parts[0] == "characters" and parts[2] == "scrolls" and method == "PUT":
