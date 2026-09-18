@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 import webbrowser
 from collections import Counter
@@ -45,6 +46,7 @@ try:
     MISSING_MODULE = None
 except ImportError as missing:  # --stop works without lxml; everything else says what to install
     MISSING_MODULE = missing.name
+from grimoire import updater  # noqa: E402  (stdlib only)
 
 APP_DIR = Path(__file__).resolve().parent
 WEB = APP_DIR / "web"
@@ -55,6 +57,11 @@ METAMAGIC_LOCK = threading.Lock()
 METAMAGIC_JOB = {"thread": None, "error": None, "failed_at": 0.0}
 LOCAL_NAME = "my-grimoire.local"  # name announced on the home network, instead of the computer's IP
 START_TOKEN = secrets.token_hex(4)  # part of every ETag: answers cached before a restart are never reused
+# this version of the app (the files it serves and runs): sent with every answer, a page loaded before an update
+# sees that the server changed and offers to reload
+APP_VERSION = hashlib.sha1("|".join(f"{f.name}:{f.stat().st_mtime_ns}:{f.stat().st_size}" for f in (
+    Path(__file__).resolve().parent / "server.py", Path(__file__).resolve().parent / "web" / "app.js",
+    Path(__file__).resolve().parent / "web" / "app.css") if f.exists()).encode()).hexdigest()[:12]
 # explicit types: on Windows the registry can map .js to text/plain, which browsers refuse for modules
 for mime_type, extension in (("text/javascript", ".js"), ("text/css", ".css"), ("application/json", ".json"),
                              ("application/manifest+json", ".webmanifest"), ("image/svg+xml", ".svg"),
@@ -1271,6 +1278,102 @@ def start_job(kind, work, **info):
     return job
 
 
+# ---------- updates from GitHub (grimoire/updater.py) ----------
+UPDATE_EVERY = 6 * 3600  # seconds between two checks in the background
+UPDATE = {"status": None, "checked": 0.0, "restart": None, "off": False}
+UPDATE_LOCK = threading.Lock()
+# getting git when it is missing: Windows downloads MinGit (automatically, once per run), macOS opens Apple's installer
+GIT_INSTALL = {"running": False, "step": None, "error": None, "opened": False, "tried": False}
+GIT_INSTALL_LOCK = threading.Lock()
+
+
+def failed_update_file(data_folder):
+    """<data>/update-failed.json: the version that didn't start here (not offered again)."""
+    return Path(data_folder) / "update-failed.json"
+
+
+def git_asked_file(data_folder):
+    """<data>/git-install-asked: Apple's installer was opened by itself once (never again: the button stays)."""
+    return Path(data_folder) / "git-install-asked"
+
+
+def start_git_install(data_folder, once=False):
+    """Gets git in the background (updater.install_git), then checks GitHub again. Returns the state for the page.
+    once: only if it wasn't tried yet in this run (the automatic attempt)."""
+    with GIT_INSTALL_LOCK:
+        if not GIT_INSTALL["running"] and not (once and GIT_INSTALL["tried"]):
+            GIT_INSTALL.update(running=True, step="Getting git", error=None, tried=True)
+
+            def run():
+                try:
+                    installed = updater.install_git(progress=lambda text: GIT_INSTALL.update(step=text))
+                    GIT_INSTALL["opened"] = installed is None  # macOS: the user finishes in Apple's installer
+                    if installed:  # checked before "running" ends: the page stops asking when it ends
+                        GIT_INSTALL["step"] = "Checking GitHub"
+                        with UPDATE_LOCK:
+                            UPDATE["status"] = None
+                        check_updates(data_folder)
+                except updater.UpdateError as error:
+                    GIT_INSTALL["error"] = str(error)
+                except Exception as error:  # a bug here must not stop the server
+                    GIT_INSTALL["error"] = f"git could not be installed ({error})."
+                finally:
+                    GIT_INSTALL.update(running=False, step=None)
+
+            threading.Thread(target=run, daemon=True).start()
+        return dict(GIT_INSTALL)
+
+
+def check_updates(data_folder, refresh=False):
+    """What updater.status() says, checked again after 6 hours (after a minute when the page asks), plus what the
+    page needs: why an update isn't offered, how to get git."""
+    if UPDATE["off"]:
+        return {"method": "off", "available": False}
+    with UPDATE_LOCK:
+        age = time.time() - UPDATE["checked"]
+        missing = UPDATE["status"] is not None and UPDATE["status"]["method"] == "missing"
+        # without git the check is quick (no network): the page asks every few seconds while Apple's installer runs
+        if UPDATE["status"] is None or age > ((5 if missing else 60) if refresh else UPDATE_EVERY - 300):
+            UPDATE["status"] = updater.status(APP_DIR)
+            UPDATE["checked"] = time.time()
+        info = dict(UPDATE["status"])
+    try:
+        failed = json.loads(failed_update_file(data_folder).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        failed = None
+    if failed and info.get("available") and failed.get("sha") == info.get("latest"):
+        info["available"] = False
+        info["blocked"] = (f"The latest version didn't start here ({failed.get('reason') or 'see data/server.log'}), so "
+                           "Grimoire went back to the one before. The next version will be offered as usual.")
+    how = updater.install_method()
+    if info["method"] == "missing" and not GIT_INSTALL["running"]:
+        if how == "mingit" and not GIT_INSTALL["tried"]:  # Windows: by itself, once per run (offline: next start)
+            start_git_install(data_folder, once=True)
+        elif how == "xcode" and not git_asked_file(data_folder).exists():  # macOS: Apple's installer opens once ever
+            try:
+                git_asked_file(data_folder).write_text(now(), encoding="utf-8")
+            except OSError:
+                pass  # not remembered: better not to open it at every check
+            else:
+                start_git_install(data_folder)
+    info["hint"] = updater.install_git_hint() if info["method"] == "missing" else None
+    info["install_method"] = how
+    info["can_install_git"] = info["method"] == "missing" and how != "manual"
+    info["git_install"] = dict(GIT_INSTALL)
+    return info
+
+
+def run_update(job, data_folder, stop_server):
+    """The update job: installs the new version, then stops the server; main() starts the new one."""
+    try:
+        undo = updater.apply(APP_DIR, data_folder, progress=lambda text: job.update(label=text))
+    except updater.UpdateError as error:
+        raise ApiError(HTTPStatus.CONFLICT, str(error))
+    UPDATE["restart"] = undo
+    job.update(label="Restarting", installed=True)
+    threading.Timer(1.0, stop_server).start()  # the page reads "installed" first
+
+
 FILTERS = {}
 
 
@@ -1495,6 +1598,7 @@ def make_handler(store, network, control=None):
             self.send_response(status)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            self.send_header("X-Grimoire-Version", APP_VERSION)
             self.send_header("Cache-Control", cache)
             self.send_header("Vary", "Accept-Encoding")
             if compress:
@@ -1687,7 +1791,28 @@ def make_handler(store, network, control=None):
                 forget_old_jobs()
                 with JOBS_LOCK:
                     jobs = sorted(JOBS.values(), key=lambda j: j.started)
-                return [job.summary() for job in jobs]
+                return [job.summary() for job in jobs if job.data["kind"] != "update"]  # its own dialog follows it
+            if parts == ["update"]:
+                data_folder = store.books.parent
+                if method == "GET":
+                    return check_updates(data_folder, refresh="refresh=1" in urlparse(self.path).query)
+                if method == "POST":
+                    # JSON only: another site open in the browser can't send it without a preflight (which fails here)
+                    if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                        raise ApiError(HTTPStatus.BAD_REQUEST, "Send the request as JSON.")
+                    with JOBS_LOCK:
+                        running = [j for j in JOBS.values() if j.data["kind"] == "update" and not j.data["finished"]]
+                    if running:
+                        return running[0].snapshot(), HTTPStatus.ACCEPTED
+                    job = start_job("update", lambda job: run_update(job, data_folder, control["server"].shutdown),
+                                    label="Updating Grimoire")
+                    return job.snapshot(), HTTPStatus.ACCEPTED
+            if parts == ["update", "install-git"] and method == "POST":
+                if not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                    raise ApiError(HTTPStatus.BAD_REQUEST, "Send the request as JSON.")
+                if updater.install_method() == "manual":
+                    raise ApiError(HTTPStatus.CONFLICT, updater.install_git_hint())
+                return start_git_install(store.books.parent), HTTPStatus.ACCEPTED
             if parts == ["instance"] and method == "GET":
                 return {"id": START_TOKEN, "data": str(store.books.parent.resolve())}
             if parts == ["shutdown"] and method == "POST":
@@ -2189,6 +2314,7 @@ class Network:
         self.all_interfaces = all_interfaces
         self.handler = None  # handler class, set after make_handler
         self.open_ip = None  # IP the extra server listens on
+        self.extra = None    # that server
         self.lock = threading.RLock()  # open() calls status() while holding it
         self.names = NameAnnouncer(name)
 
@@ -2212,6 +2338,10 @@ class Network:
 
     def close(self):
         self.names.stop()
+        if self.extra:  # a restart after an update listens on the same port again
+            self.extra.shutdown()
+            self.extra.server_close()
+            self.extra = None
 
     def open(self):
         with self.lock:
@@ -2229,6 +2359,7 @@ class Network:
                                "Restart with: python3 server.py --network")
             threading.Thread(target=server.serve_forever, daemon=True).start()
             self.open_ip = ip
+            self.extra = server
         status = self.status()
         print(f"Devices on the same Wi-Fi can now open {phone_addresses(status)}  (no password: anyone on this network can edit your books)", flush=True)
         return status
@@ -2308,37 +2439,32 @@ def stop_instance(data_folder):
     return 0
 
 
-def start_in_background(args, argv):
-    """--start: the server runs as a separate process without a window (its output goes to <data>/server.log);
-    this command returns as soon as the server answers, or shows why it didn't start."""
-    existing = running_instance(args.data)
-    if existing:
-        print(f"Grimoire is already running at {existing['address']}")
-        if not args.no_browser:
-            webbrowser.open(existing["address"])
-        return 0
+def background_python():
+    """The Python that runs the server in the background: pythonw.exe on Windows (no window)."""
     python = Path(sys.executable)
-    options = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
+    if os.name == "nt" and python.with_name("pythonw.exe").exists():
+        python = python.with_name("pythonw.exe")
+    return python
+
+
+def launch_background(command, data_folder):
+    """Starts the server as a separate process without a window and waits (up to a minute) until it answers.
+    Returns (its run file, "") or (None, what it wrote in <data>/server.log)."""
+    log = Path(data_folder) / "server.log"
+    size_before = log.stat().st_size if log.exists() else 0
+    # what it writes before opening the log itself (a syntax error, a missing module) goes to the log too
+    output = open(log, "a", encoding="utf-8")
+    options = {"stdin": subprocess.DEVNULL, "stdout": output, "stderr": output}
     if os.name == "nt":
-        if python.with_name("pythonw.exe").exists():
-            python = python.with_name("pythonw.exe")
         options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
     else:
         options["start_new_session"] = True  # keeps running when the terminal is closed
-    command = [str(python), "-B", str(APP_DIR / "server.py"), *[a for a in argv if a != "--start"], "--background"]
-    try:
-        Path(args.data).mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        print(f"Grimoire did not start: the data folder {args.data} can't be used ({error.strerror}).")
-        return 1
-    log = Path(args.data) / "server.log"
-    size_before = log.stat().st_size if log.exists() else 0
-    process = subprocess.Popen(command, cwd=APP_DIR, **options)
+    with output:
+        process = subprocess.Popen(command, cwd=APP_DIR, **options)
     for _ in range(600):  # up to a minute (the first start of a big library renames its files)
-        info = running_instance(args.data)
+        info = running_instance(data_folder)
         if info:
-            print(f"Grimoire is running at {info['address']}\nStop it with the stop script (or: python3 server.py --stop).")
-            return 0
+            return info, ""
         if process.poll() is not None:
             break
         time.sleep(0.1)
@@ -2349,7 +2475,130 @@ def start_in_background(args, argv):
             output = file.read().strip()
     except OSError:
         output = ""
+    return None, output
+
+
+def start_in_background(args, argv):
+    """--start: the server runs as a separate process without a window (its output goes to <data>/server.log);
+    this command returns as soon as the server answers, or shows why it didn't start."""
+    existing = running_instance(args.data)
+    if existing:
+        print(f"Grimoire is already running at {existing['address']}")
+        if not args.no_browser:
+            webbrowser.open(existing["address"])
+        return 0
+    command = [str(background_python()), "-B", str(APP_DIR / "server.py"), *[a for a in argv if a != "--start"], "--background"]
+    try:
+        Path(args.data).mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        print(f"Grimoire did not start: the data folder {args.data} can't be used ({error.strerror}).")
+        return 1
+    info, output = launch_background(command, args.data)
+    if info:
+        print(f"Grimoire is running at {info['address']}\nStop it with the stop script (or: python3 server.py --stop).")
+        return 0
     print("Grimoire did not start." + (f"\n{output}" if output else ""))
+    return 1
+
+
+def restart_after_update(data_folder, port, network_open, undo):
+    """After an update: starts the new version in the background on the same port (the page looks for it there),
+    without opening the browser, with the home network still open if it was. If it doesn't answer, the previous
+    version is put back and started instead, and that version isn't offered again (update-failed.json)."""
+    argv, skip = [], {"--start", "--background", "--no-browser", "--update", "--network", "--port"}
+    args = iter(sys.argv[1:])
+    for arg in args:
+        if arg == "--port":
+            next(args, None)
+        elif arg not in skip and not arg.startswith("--port="):
+            argv.append(arg)
+    command = [str(background_python()), "-B", str(APP_DIR / "server.py"), *argv,
+               "--background", "--no-browser", "--port", str(port), *(["--network"] if network_open else [])]
+    print("Grimoire was updated: starting the new version…", flush=True)
+    info, output = launch_background(command, data_folder)
+    if info:
+        updater.forget_previous(APP_DIR)
+        failed_update_file(data_folder).unlink(missing_ok=True)
+        print(f"The new version is running at {info['address']} (in the background: stop it with the stop script).", flush=True)
+        return 0
+    lines = [line for line in output.splitlines() if line.strip() and not line.startswith("---")]
+    reason = lines[-1].strip()[:200] if lines else "it didn't answer"
+    print("The new version didn't start" + (f":\n{output}" if output else ".") + "\nGoing back to the previous version.", flush=True)
+    try:
+        updater.rollback(APP_DIR, undo)
+    except updater.UpdateError as error:
+        print(f"Could not go back to the previous version: {error}", flush=True)
+        return 1
+    tmp = failed_update_file(data_folder).with_suffix(".tmp")
+    tmp.write_text(json.dumps({"sha": undo.get("sha"), "reason": reason, "at": now()}), encoding="utf-8")
+    os.replace(tmp, failed_update_file(data_folder))
+    info, output = launch_background(command, data_folder)
+    print(f"The previous version is running again at {info['address']}." if info
+          else "The previous version didn't start either:\n" + output, flush=True)
+    return 1
+
+
+def update_command(args):
+    """--update: asks the running server to update itself (it restarts), or updates this folder directly."""
+    info = running_instance(args.data)
+    if not info:
+        status = updater.status(APP_DIR)
+        if status["method"] == "missing":
+            if updater.install_method() == "manual":
+                print("Updates need git. " + updater.install_git_hint())
+                return 1
+            try:
+                installed = updater.install_git(progress=lambda text: print(text + "…", flush=True))
+            except updater.UpdateError as error:
+                print(error)
+                return 1
+            if not installed:  # macOS: Apple's installer is open
+                print("When Apple's installer is done, run this command again.")
+                return 1
+            status = updater.status(APP_DIR)
+        if status["error"] or status["blocked"]:
+            print(status["error"] or status["blocked"])
+            return 1
+        if not status["available"]:
+            print("Grimoire is already up to date.")
+            return 0
+        try:
+            updater.apply(APP_DIR, args.data, progress=lambda text: print(text + "…", flush=True))
+        except updater.UpdateError as error:
+            print(error)
+            return 1
+        updater.forget_previous(APP_DIR)
+        print("Grimoire was updated. Start it with the start script.")
+        return 0
+    base = f"http://127.0.0.1:{int(info['port'])}/api/"
+    request = urllib.request.Request(base + "update", data=b"{}", method="POST", headers={"Content-Type": "application/json"})
+    try:
+        job = json.load(urllib.request.urlopen(request, timeout=10))
+        last = None
+        while True:
+            job = json.load(urllib.request.urlopen(base + f"jobs/{job['id']}", timeout=10))
+            if job.get("label") != last:
+                last = job.get("label")
+                print(f"{last}…", flush=True)
+            if job.get("finished") or job.get("installed"):
+                break
+            time.sleep(0.5)
+    except urllib.error.HTTPError as error:
+        print(json.loads(error.read() or b"{}").get("error") or f"Error {error.code}")
+        return 1
+    except OSError as error:
+        print(f"Grimoire didn't answer ({error}).")
+        return 1
+    if job.get("error"):
+        print(job["error"])
+        return 1
+    for _ in range(900):  # the old server stops, the new one starts (it can go back to the old one)
+        again = running_instance(args.data)
+        if again and again.get("id") != info.get("id"):
+            print(f"Grimoire was updated and is running at {again['address']}")
+            return 0
+        time.sleep(0.2)
+    print("Grimoire didn't come back after the update: see data/server.log.")
     return 1
 
 
@@ -2366,10 +2615,16 @@ def main():
     parser.add_argument("--start", action="store_true",
                         help="run in the background without a window, and return when it answers")
     parser.add_argument("--stop", action="store_true", help="stop the server running on this data folder")
+    parser.add_argument("--update", action="store_true",
+                        help="install the latest version from GitHub (with git) and restart the server if it runs")
+    parser.add_argument("--no-update-check", action="store_true", help="do not check GitHub for new versions")
     parser.add_argument("--background", action="store_true", help=argparse.SUPPRESS)  # output to <data>/server.log
     args = parser.parse_args()
     if args.stop:
         sys.exit(stop_instance(args.data))
+    if args.update:
+        sys.exit(update_command(args))
+    UPDATE["off"] = args.no_update_check
     if MISSING_MODULE:
         sys.exit(f"Missing Python module: {MISSING_MODULE}. Install it with: python3 -m pip install -r requirements.txt "
                  "(or use the start script for your system).")
@@ -2382,7 +2637,10 @@ def main():
     if args.background or sys.stdout is None:  # no window (pythonw): everything goes to the log
         log = Path(args.data) / "server.log"
         if log.exists() and log.stat().st_size > 2_000_000:
-            os.replace(log, log.with_suffix(".log.old"))
+            try:
+                os.replace(log, log.with_suffix(".log.old"))
+            except OSError:  # Windows: still open (the previous version, waiting for this one after an update)
+                pass
         sys.stdout = sys.stderr = open(log, "a", encoding="utf-8", buffering=1)
         print(f"--- {now()}")
     existing = running_instance(args.data)
@@ -2429,6 +2687,7 @@ def main():
     port = server.server_address[1]
     network.port = port
     control["server"] = server
+    loopback6 = None
     try:
         loopback6 = LoopbackV6Server(("::1", port), handler)
         threading.Thread(target=loopback6.serve_forever, daemon=True).start()
@@ -2453,6 +2712,16 @@ def main():
     os.replace(tmp, run_file(args.data))
     if not args.no_browser:
         open_browser(address)
+    if not args.no_update_check:  # a new version on GitHub: the page shows an Update button
+        def watch_updates():
+            if STOPPING.wait(20):
+                return
+            while True:
+                check_updates(args.data)
+                if STOPPING.wait(UPDATE_EVERY):
+                    return
+
+        threading.Thread(target=watch_updates, daemon=True).start()
     # stopped by the system (kill, logout): same clean exit as Ctrl+C, so the name announcement stops too
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     try:
@@ -2461,14 +2730,20 @@ def main():
     except KeyboardInterrupt:
         print("\nGrimoire stopped.")
     finally:
+        network_open = bool(network.all_interfaces or network.extra)
         cancel_all_jobs()
         network.close()
         server.server_close()
+        if loopback6:
+            loopback6.shutdown()
+            loopback6.server_close()
         try:
             if json.loads(run_file(args.data).read_text(encoding="utf-8")).get("id") == START_TOKEN:
                 run_file(args.data).unlink()
         except (OSError, ValueError):
             pass
+    if UPDATE["restart"] is not None:  # the port and the run file are free: the new version takes over
+        sys.exit(restart_after_update(args.data, port, network_open, UPDATE["restart"]))
 
 
 if __name__ == "__main__":

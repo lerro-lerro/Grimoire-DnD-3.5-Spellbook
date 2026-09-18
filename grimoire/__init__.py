@@ -5,4 +5,5 @@
     units       imperial measurements to metric
     conditions  the SRD conditions (web/conditions.json), downloaded when missing
     metamagic   the dndtools metamagic feats (web/metamagic.json), downloaded when missing
+    updater     updates from GitHub with git (no lxml needed: python3 server.py --update works without it)
 """

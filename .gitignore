@@ -10,6 +10,12 @@ CLAUDE.md
 .claude/
 personal/
 
+# The files a ZIP copy had before its first update (kept to go back if the new version doesn't start)
+.update-previous/
+
+# Windows: the git Grimoire downloads for its updates when the computer has none (MinGit)
+.git-tools/
+
 # Python
 __pycache__/
 *.py[cod]

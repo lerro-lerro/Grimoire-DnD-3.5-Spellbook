@@ -97,6 +97,34 @@ button, input, select, textarea { font: inherit; color: inherit; }
   padding: 2rem clamp(1rem, 4vw, 3rem) 5rem;
 }
 
+/* ===== icons (icon() in app.js): drawn in SVG, in the color of the text ===== */
+.icon { width: 1.1em; height: 1.1em; flex: none; vertical-align: -.17em; overflow: visible; fill: none; stroke: currentColor;
+        stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.icon .solid, .icon.filled { fill: currentColor; }
+.icon .solid { stroke: none; }
+.seal .icon { width: 1.05rem; height: 1.05rem; color: var(--gold-light); }
+.tome .ornament .icon { width: 1.6rem; height: 1.6rem; }
+.favorite-button .icon { width: 1.15rem; height: 1.15rem; }
+.favorite-button[aria-pressed="true"] .icon-heart { fill: currentColor; }
+.row-star .icon { width: 1.25rem; height: 1.25rem; }
+.chip .chip-icon { width: 1em; height: 1em; margin-right: .05rem; }
+.prepared-badge, .scroll-badge { display: inline-flex; align-items: center; gap: .2rem; }
+.prepared-badge .icon, .scroll-badge .icon { width: 1em; height: 1em; vertical-align: 0; }
+.level-note .icon, .slot .star .icon, [data-spec-note] .icon { width: .95em; height: .95em; }
+.dock-toggle.busy::before {
+  content: "";
+  display: inline-block;
+  width: .7em;
+  height: .7em;
+  margin-right: .45em;
+  border: 2px solid currentColor;
+  border-right-color: transparent;
+  border-radius: 50%;
+  vertical-align: -.05em;
+  animation: spin 1s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) { .dock-toggle.busy::before { animation: none; } }
+
 /* ===== buttons ===== */
 .button {
   display: inline-flex;
@@ -128,6 +156,31 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .button.ghost:hover { border-color: rgba(232, 207, 138, .35); }
 .button.danger { color: #f4c9c0; border-color: rgba(155, 44, 44, .6); background: rgba(155, 44, 44, .15); }
 .button.danger:hover { background: rgba(155, 44, 44, .35); border-color: #c24a4a; }
+
+/* ===== updates ===== */
+.bar-actions .update-button { color: #241808; background: linear-gradient(to bottom, var(--gold-light), var(--gold)); border-color: var(--gold-dark); font-weight: 700; }
+.bar-actions .update-button[hidden] { display: none; }
+.update-commits { margin: 0; padding-left: 1.1rem; display: grid; gap: .35rem; max-height: 16rem; overflow-y: auto; }
+.update-commits time { color: var(--parchment-border); font-size: .85rem; white-space: nowrap; }
+.update-more { list-style: none; margin-left: -1.1rem; color: var(--parchment-border); font-style: italic; }
+.update-progress:empty { display: none; }
+.update-progress p { margin: 0; }
+.git-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .6rem 1rem;
+  margin: -1rem 0 2rem;
+  padding: .7rem 1rem;
+  border-radius: var(--radius);
+  border: 1px solid rgba(232, 207, 138, .3);
+  background: rgba(0, 0, 0, .25);
+  color: var(--parchment-2);
+}
+.git-note[hidden] { display: none; }
+.git-note p { margin: 0; flex: 1 1 20rem; }
+.git-note-actions { display: flex; gap: .5rem; }
 
 /* ===== library ===== */
 .header {
@@ -356,7 +409,11 @@ button, input, select, textarea { font: inherit; color: inherit; }
 }
 .level-nav a:hover { background: rgba(232, 207, 138, .15); }
 .level-nav span { opacity: .25; }
-.school-filters { display: flex; flex-wrap: wrap; gap: .35rem; }
+/* quick filters and schools: one row of chips on a computer; on a phone the schools are in a parchment box, all of
+   them wrapped, like the forbidden schools of Prepared */
+.chip-filters { display: flex; flex-wrap: wrap; gap: .35rem; }
+.quick-filters, .school-filters, .school-chips { display: contents; }
+.school-filters-head, .school-others { display: none; }
 
 /* "More filters": description, range, duration… one field of the sheet each (a sheet over the page on a phone) */
 .more-filters-toggle {
@@ -502,7 +559,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .chip i { width: .6rem; height: .6rem; border-radius: 50%; background: var(--c); display: inline-block; }
 .chip[aria-pressed="true"] { background: var(--c); border-color: var(--c); color: #fff; }
 .chip[aria-pressed="true"] i { background: #fff; }
-.chip-icon { line-height: 1; margin-right: .1rem; }
+.chip-icon { flex: none; }
 .favorite-chip .chip-icon { color: #c2394f; }
 .chip[aria-pressed="true"] .chip-icon { color: #fff; }
 
@@ -1684,7 +1741,7 @@ button.row-star[aria-pressed="true"] { color: #fff8e6; background: var(--gold-da
   .level-menu-panel { left: 0; right: auto; }
   .field-filter-grid input { font-size: 16px; }
   /* rows that scroll sideways fade out at the end: there is more */
-  .level-nav, .school-filters, .book-filters {
+  .level-nav {
     flex-wrap: nowrap;
     width: 100%;
     overflow-x: auto;
@@ -1730,7 +1787,49 @@ button.row-star[aria-pressed="true"] { color: #fff8e6; background: var(--gold-da
   .component-filters { grid-template-columns: 1fr; gap: .45rem; }
   .field-filters-foot { padding: .7rem 1rem calc(.7rem + env(safe-area-inset-bottom)); background: rgba(0, 0, 0, .25); }
   .field-filters-foot .button { flex: 1; justify-content: center; }
-  .level-nav::-webkit-scrollbar, .school-filters::-webkit-scrollbar, .book-filters::-webkit-scrollbar { display: none; }
+  .level-nav::-webkit-scrollbar { display: none; }
+  .book-filters { width: 100%; }
+  .chip-filters { flex-direction: column; flex-wrap: nowrap; gap: .6rem; width: 100%; }
+  .quick-filters { display: flex; flex-wrap: wrap; gap: .35rem; }
+  .school-filters {
+    display: block;
+    padding: .75rem .8rem .85rem;
+    border-radius: var(--radius);
+    color: var(--ink);
+    background:
+      radial-gradient(ellipse at 50% 0%, rgba(255, 255, 255, .55), transparent 60%),
+      radial-gradient(ellipse at 0% 100%, rgba(139, 101, 51, .20), transparent 45%),
+      linear-gradient(var(--parchment), var(--parchment-2));
+    box-shadow: var(--shadow), inset 0 0 40px rgba(120, 85, 40, .22);
+  }
+  .school-filters-head {
+    display: flex;
+    align-items: center;
+    gap: .45rem;
+    width: 100%;
+    min-height: 2.75rem;
+    margin: -.4rem 0 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    font-family: var(--title-font);
+    font-size: .8rem;
+    letter-spacing: .1em;
+    text-transform: uppercase;
+    color: var(--ink);
+    text-align: left;
+    cursor: pointer;
+  }
+  .school-filters-head::after { content: "▾"; margin-left: auto; font-size: 1rem; color: var(--ink-faint); transition: transform .15s; }
+  .school-filters.collapsed .school-filters-head::after { transform: rotate(-90deg); }
+  .school-count { font-family: var(--body-font); font-size: .9rem; letter-spacing: 0; text-transform: none; color: var(--ink-faint); font-style: italic; }
+  .school-chips { display: flex; flex-wrap: wrap; gap: .3rem; }
+  .school-chips .chip { padding-inline: .6rem; gap: .3rem; }
+  /* the schools that aren't one of the eight (or Universal): on a line of their own, under a small title */
+  .school-others { display: block; flex: 1 1 100%; margin: .45rem 0 .05rem; font-family: var(--title-font); font-size: .66rem; letter-spacing: .12em; text-transform: uppercase; color: var(--ink-faint); }
+  .school-filters.collapsed .school-chips { display: none; }
+  .school-chips .chip { color: var(--ink); border-color: rgba(107, 88, 66, .45); font-family: var(--body-font); }
+  .school-chips .chip[aria-pressed="true"] { color: #fff; }
   .chip { flex: none; }
   .level-section { scroll-margin-top: 4.5rem; }
   .parchment { padding: 1rem .8rem; }

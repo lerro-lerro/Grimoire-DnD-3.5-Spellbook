@@ -50,6 +50,7 @@ const CAN_PASTE = Boolean(window.isSecureContext && navigator.clipboard?.readTex
 
 // levels folded in each tab ("book", "prepared", "scrolls"), remembered in this browser
 const FOLD_KEY = "grimoire-folded-v1";
+const SCHOOLS_FOLD_KEY = "grimoire-schools-folded-v1"; // the "Schools" box of the filter bar, folded on a phone
 
 function loadFolded() {
   let saved = {};
@@ -89,6 +90,26 @@ const state = {
   selectionLevels: new Map(), // level -> ids of the spells shown in it
   selectionOrder: [], // ids of the spells shown, in page order
 };
+
+// ---------- icons ----------
+// Drawn in SVG, the same on every device: emoji and symbols such as ✚ 📜 ☍ ❦ depend on the fonts of each phone or
+// computer (an empty box, or another shape). They take the color of the text; "solid" parts are filled.
+const ICON_PATHS = {
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  search: '<circle cx="10.5" cy="10.5" r="6.5"/><path d="m15.5 15.5 5 5"/>',
+  book: '<path d="M12 6.4C9.2 4.6 6.1 4.4 3 5.6v13c3.1-1.2 6.2-1 9 .8 2.8-1.8 5.9-2 9-.8v-13c-3.1-1.2-6.2-1-9 .8zM12 6.4v13"/>',
+  sparkle: '<path class="solid" d="M12 2.5l2 7.5 7.5 2-7.5 2-2 7.5-2-7.5-7.5-2 7.5-2z"/>',
+  scroll: '<path d="M5.5 4h13a1.5 1.5 0 0 1 0 3h-13a1.5 1.5 0 0 1 0-3zM5.5 17h13a1.5 1.5 0 0 1 0 3h-13a1.5 1.5 0 0 1 0-3zM6.5 7v10M17.5 7v10M9.5 10.5h5M9.5 13.5h3.5"/>',
+  heart: '<path d="M12 20s-7.3-4.4-9-9.1C1.9 7.7 3.8 4.5 7 4.5c2 0 3.5 1.1 5 3 1.5-1.9 3-3 5-3 3.2 0 5.1 3.2 4 6.4-1.7 4.7-9 9.1-9 9.1z"/>',
+  star: '<path d="M12 3.3l2.6 5.5 6 .8-4.4 4.1 1.1 6-5.3-2.9-5.3 2.9 1.1-6L3.4 9.6l6-.8z"/>',
+  moon: '<path d="M19.5 14.8A8 8 0 0 1 9.2 4.5a8 8 0 1 0 10.3 10.3z"/>',
+  ornament: '<path d="M12 4.5l2.6 7.5L12 19.5 9.4 12z"/><path d="M3.5 12h4M16.5 12h4"/><circle class="solid" cx="12" cy="12" r="1.1"/>',
+};
+
+// className: "filled" fills the outline (a favorite heart, a marked star)
+function icon(name, className = "") {
+  return `<svg class="icon icon-${name}${className ? ` ${className}` : ""}" viewBox="0 0 24 24" aria-hidden="true">${ICON_PATHS[name]}</svg>`;
+}
 
 // ---------- utilities ----------
 const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
@@ -165,12 +186,25 @@ function shortDate(iso) {
 
 const OUTDATED_SERVER = "The server is out of date: stop server.py (Ctrl+C), start it again and reload the page.";
 
+// The version of the app the server runs (X-Grimoire-Version): when it changes, Grimoire was updated while this page
+// was open (from another device, or python3 server.py --update): its JavaScript is the old one, so it offers to reload
+const serverVersion = { first: null, told: false };
+
+function noteServerVersion(version) {
+  if (!version) return;
+  serverVersion.first ||= version;
+  if (version === serverVersion.first || serverVersion.told || update.running) return;
+  serverVersion.told = true;
+  notify("Grimoire was updated: reload the page to use the new version.", false, { label: "Reload", run: () => location.reload() });
+}
+
 async function api(path, options = {}) {
   const response = await fetch(`/api/${path}`, {
     method: options.method || "GET",
     headers: options.body ? { "Content-Type": "application/json" } : undefined,
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
+  noteServerVersion(response.headers.get("X-Grimoire-Version"));
   let data = null;
   try { data = await response.json(); } catch { /* empty response */ }
   // 501/405 without JSON = server started before an app update
@@ -605,7 +639,7 @@ async function showLibrary() {
   const tome = (book) => `
     <a class="tome ${book.unavailable ? "unavailable" : ""}" href="#/book/${esc(book.id)}" style="--cover:${COVERS[book.color] || COVERS.crimson}">
       ${book.unavailable ? `<div class="tome-status">${esc(unavailableLabel(book))}</div>` : ""}
-      <div class="ornament">❦</div>
+      <div class="ornament">${icon("ornament")}</div>
       <h2>${esc(book.name)}</h2>
       <div class="owner">${esc(book.caster_class)}</div>
       <div class="footer">
@@ -631,7 +665,7 @@ async function showLibrary() {
         <div class="shelf">
           ${ownBooks.length ? `
           <a class="tome all" href="#/character/${esc(pc.id)}">
-            <div class="ornament">✦</div>
+            <div class="ornament">${icon("sparkle")}</div>
             <h2>All spellbooks</h2>
             <div class="owner">every spell of ${esc(pc.name)}, and what is prepared today</div>
             <div class="footer">
@@ -656,10 +690,12 @@ async function showLibrary() {
         <h1>The Library</h1>
         <p>${characters.length ? "Each character has their own spellbooks, one or more classes, spells per day and prepared spells." : "Every spellcaster starts with a name and a blank book."}</p>
       </div>
-      <button class="button gold" id="new-character" type="button">✚ New character</button>
+      <button class="button gold" id="new-character" type="button">${icon("plus")}New character</button>
     </div>
+    <div class="git-note" id="git-note" hidden></div>
     ${sections || `<div class="empty dark"><div class="big">No characters yet</div><p>Create a character, then give them a spellbook.</p></div>`}`;
   $("#new-character").addEventListener("click", () => openCharacterDialog(null));
+  renderGitNote();
   app.querySelectorAll("[data-new-book]").forEach((button) => button.addEventListener("click", () => openBookDialog(null, button.dataset.newBook)));
   app.querySelectorAll("[data-edit-character]").forEach((button) => button.addEventListener("click", () => {
     openCharacterDialog(characters.find((pc) => pc.id === button.dataset.editCharacter));
@@ -979,7 +1015,11 @@ function filteredSpells() {
 
 function filterBar() {
   const book = state.book;
-  const schools = [...new Set(book.spells.map((v) => v.spell.school))].filter(Boolean).sort();
+  // the eight schools (and Universal) first, then the others: two schools together, Tome of Battle disciplines…
+  const main = [...SPECIALIST_SCHOOLS, "Universal"];
+  const schools = [...new Set(book.spells.map((v) => v.spell.school))].filter(Boolean)
+    .sort((a, b) => (main.includes(a) ? main.indexOf(a) : main.length) - (main.includes(b) ? main.indexOf(b) : main.length) || a.localeCompare(b));
+  const firstOther = schools.findIndex((name) => !main.includes(name));
   const books = book.all && book.books.length > 1 ? book.books : [];
   // filters of one tab: prepared copies (classes that prepare) and scrolls owned
   const onlyPrepared = state.view === "prepared" && viewClasses().some((c) => c.casting === "prepared");
@@ -1041,16 +1081,34 @@ function filterBar() {
       ${books.length ? `<div class="book-filters" role="group" aria-label="Spellbooks">
         ${books.map((b) => `<button type="button" class="chip book-chip" data-book="${esc(b.id)}" aria-pressed="${state.bookFilters.has(b.id)}" style="--c:${COVERS[b.color] || COVERS.crimson}"><i></i>${esc(b.name)}</button>`).join("")}
       </div>` : ""}
-      <div class="school-filters" role="group" aria-label="Quick filters and schools">
-        ${onlyPrepared ? `<button type="button" class="chip only-chip" data-only="prepared" aria-pressed="${state.onlyPrepared}"><span class="chip-icon" aria-hidden="true">✦</span>Only prepared</button>` : ""}
-        ${state.view === "scrolls" ? `<button type="button" class="chip only-chip" data-only="owned" aria-pressed="${state.onlyOwned}"><span class="chip-icon" aria-hidden="true">📜</span>Only owned</button>` : ""}
-        <button type="button" class="chip favorite-chip" data-favorites aria-pressed="${state.onlyFavorites}"><span class="chip-icon" aria-hidden="true">♥</span>Favorites</button>
-        ${schools.map((s) => `<button type="button" class="chip" data-school="${esc(s)}" aria-pressed="${state.schoolFilters.has(s)}" style="--c:${schoolColor({ school: s })}"><i></i>${esc(SCHOOLS[s] || s)}</button>`).join("")}
+      <div class="chip-filters">
+        <div class="quick-filters" role="group" aria-label="Quick filters">
+          ${onlyPrepared ? `<button type="button" class="chip only-chip" data-only="prepared" aria-pressed="${state.onlyPrepared}">${icon("sparkle", "chip-icon")}Only prepared</button>` : ""}
+          ${state.view === "scrolls" ? `<button type="button" class="chip only-chip" data-only="owned" aria-pressed="${state.onlyOwned}">${icon("scroll", "chip-icon")}Only owned</button>` : ""}
+          <button type="button" class="chip favorite-chip" data-favorites aria-pressed="${state.onlyFavorites}">${icon("heart", "chip-icon filled")}Favorites</button>
+        </div>
+        ${schools.length ? `<div class="school-filters ${schoolsFolded() ? "collapsed" : ""}" role="group" aria-labelledby="school-filters-title">
+          <button type="button" class="school-filters-head" id="school-filters-title" aria-expanded="${!schoolsFolded()}">Schools<span class="school-count" id="school-count"></span></button>
+          <div class="school-chips">
+            ${schools.map((s, i) => `${i && i === firstOther ? `<span class="school-others">Others</span>` : ""}<button type="button" class="chip" data-school="${esc(s)}" aria-pressed="${state.schoolFilters.has(s)}" style="--c:${schoolColor({ school: s })}"><i></i>${esc(SCHOOLS[s] || s)}</button>`).join("")}
+          </div>
+        </div>` : ""}
       </div>
     </div>`;
 }
 
-// Small icons drawn in SVG: fonts on phones don't always have ✕ or ⚙ in the text style
+// More icons drawn in SVG (see icon()): fonts on phones don't always have ✕ or ⚙
+// On a phone the schools are in a box that can be folded (all of them, wrapped: no scrolling sideways)
+function schoolsFolded() {
+  try { return localStorage.getItem(SCHOOLS_FOLD_KEY) === "1"; } catch { return false; }
+}
+
+function foldSchools(folded) {
+  try { localStorage.setItem(SCHOOLS_FOLD_KEY, folded ? "1" : "0"); } catch { /* only not remembered */ }
+  $(".school-filters")?.classList.toggle("collapsed", folded); // not "folded": that class hides a level's rows
+  $("#school-filters-title")?.setAttribute("aria-expanded", !folded);
+}
+
 const FUNNEL_ICON = `<svg class="funnel" viewBox="0 0 24 24" aria-hidden="true"><path d="M3.5 5h17l-6.6 7.6v5.6l-3.8 1.9v-7.5z"/></svg>`;
 const CLOSE_ICON = `<svg class="x-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6 6 18"/></svg>`;
 const GEAR_ICON = `<svg class="gear-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>`;
@@ -1080,6 +1138,7 @@ function bindFilterBar() {
     if (event.target.closest("#select-toggle")) return setSelecting(!state.selecting);
     if (event.target.closest("#more-filters-toggle")) return setMoreFilters(!state.moreFilters);
     if (event.target.closest("#close-field-filters, #done-field-filters, #field-filters-backdrop")) return setMoreFilters(false);
+    if (event.target.closest("#school-filters-title")) return foldSchools(!$(".school-filters").classList.contains("collapsed"));
     if (event.target.closest("#retry-texts")) return loadSpellTexts();
     if (event.target.closest("#clear-field-filters")) {
       state.fieldFilters = {};
@@ -1150,9 +1209,9 @@ function updateActiveFilters() {
   if (!box) return;
   const pills = [];
   const onlyPrepared = state.view === "prepared" && viewClasses().some((c) => c.casting === "prepared");
-  if (onlyPrepared && state.onlyPrepared) pills.push(["only:prepared", "✦ Only prepared"]);
-  if (state.view === "scrolls" && state.onlyOwned) pills.push(["only:owned", "📜 Only owned"]);
-  if (state.onlyFavorites) pills.push(["favorites", "♥ Favorites"]);
+  if (onlyPrepared && state.onlyPrepared) pills.push(["only:prepared", "Only prepared"]);
+  if (state.view === "scrolls" && state.onlyOwned) pills.push(["only:owned", "Only owned"]);
+  if (state.onlyFavorites) pills.push(["favorites", "Favorites"]);
   if (state.book.all) for (const id of state.bookFilters) pills.push([`book:${id}`, state.book.books.find((b) => b.id === id)?.name || id]);
   for (const name of state.schoolFilters) pills.push([`school:${name}`, SCHOOLS[name] || name]);
   for (const [key, label] of FIELD_FILTERS) {
@@ -1166,6 +1225,8 @@ function updateActiveFilters() {
   box.innerHTML = pills.map(([key, text]) => `<button type="button" class="filter-pill" data-remove-filter="${esc(key)}"
       aria-label="Remove the filter ${esc(text)}"><span>${esc(text)}</span><span class="pill-x">${CLOSE_ICON}</span></button>`).join("")
     + (pills.length > 1 ? `<button type="button" class="link clear-all-filters" data-remove-filter="all">Clear all</button>` : "");
+  const schoolCount = $("#school-count");
+  if (schoolCount) schoolCount.textContent = state.schoolFilters.size ? `· ${state.schoolFilters.size} chosen` : "";
   const count = fieldFilterCount();
   const badge = $("#field-filter-count");
   badge.hidden = !count;
@@ -1359,8 +1420,8 @@ function renderBook() {
         </div>
       </div>
       <div class="book-actions">
-        ${book.unavailable ? "" : `<button class="button gold" id="open-add" type="button">✚ Add spell</button>
-        <button class="button" id="open-finder" type="button" aria-label="Search dndtools">🔍 Search<span class="wide-only-bar">dndtools</span></button>`}
+        ${book.unavailable ? "" : `<button class="button gold" id="open-add" type="button">${icon("plus")}Add spell</button>
+        <button class="button" id="open-finder" type="button" aria-label="Search dndtools">${icon("search")}Search<span class="wide-only-bar">dndtools</span></button>`}
         <button class="button" id="book-settings" type="button" aria-label="Settings" title="Settings">${GEAR_ICON}<span class="wide-only-bar">Settings</span></button>
       </div>
     </section>`;
@@ -1377,13 +1438,13 @@ function renderBook() {
 
     <nav class="book-tabs" aria-label="Book sections">
       <a href="${collectionPath()}" class="${state.view === "book" ? "active" : ""}" ${state.view === "book" ? 'aria-current="page"' : ""}>
-        <span class="tab-icon" aria-hidden="true">📖</span> Spellbook <span class="count">${book.spell_count}</span>
+        ${icon("book", "tab-icon")} Spellbook <span class="count">${book.spell_count}</span>
       </a>
       <a href="${collectionPath()}/prepared" class="${state.view === "prepared" ? "active" : ""}" ${state.view === "prepared" ? 'aria-current="page"' : ""}>
-        <span class="tab-icon" aria-hidden="true">✦</span> <span id="prepared-label">${preparedTabLabel()}</span> <span class="count" id="prepared-count">${preparedCountText()}</span>
+        ${icon("sparkle", "tab-icon")} <span id="prepared-label">${preparedTabLabel()}</span> <span class="count" id="prepared-count">${preparedCountText()}</span>
       </a>
       <a href="${collectionPath()}/scrolls" class="${state.view === "scrolls" ? "active" : ""}" ${state.view === "scrolls" ? 'aria-current="page"' : ""}>
-        <span class="tab-icon" aria-hidden="true">📜</span> Scrolls <span class="count" id="scroll-count">${scrollTotals(viewClasses()).count}</span>
+        ${icon("scroll", "tab-icon")} Scrolls <span class="count" id="scroll-count">${scrollTotals(viewClasses()).count}</span>
       </a>
       ${book.all ? "" : `<a class="all-link" href="#/character/${esc(pc.id)}${state.view === "book" ? "" : `/${state.view}`}" title="All spellbooks"><span class="wide-only-bar">All spellbooks </span><span class="narrow-only-bar">All </span>→</a>`}
     </nav>
@@ -1433,7 +1494,7 @@ function renderPages() {
       <div class="empty">
         <div class="big">The pages are still blank</div>
         <p>${book.unavailable ? "This book has no spells." : "Add your first spell by pasting the link to its page on dndtools."}</p>
-        ${book.unavailable ? "" : `<button class="button gold" type="button" data-action="add">✚ Add spell</button>`}
+        ${book.unavailable ? "" : `<button class="button gold" type="button" data-action="add">${icon("plus")}Add spell</button>`}
       </div>`;
     container.querySelector("[data-action]")?.addEventListener("click", openAddDialog);
     return finish();
@@ -1629,7 +1690,7 @@ async function removeSelected() {
     `Remove ${count}`, {
       text: `Delete ${ids.length === 1 ? "it" : "them"} for good`,
       label: `Delete ${count} for good`,
-      warning: `${list} will be deleted from “${book.name}” for good: their levels, and the prepared copies, scrolls, favorite and ★ marks they have through this book, are lost (their downloaded pages too, if no other book or spell uses them). This can't be undone.`,
+      warning: `${list} will be deleted from “${book.name}” for good: their levels, and the prepared copies, scrolls, favorite and domain marks they have through this book, are lost (their downloaded pages too, if no other book or spell uses them). This can't be undone.`,
     });
   if (!answer) return;
   const forever = answer === "option";
@@ -1684,7 +1745,7 @@ function spellCard(entry) {
   return `
     <button type="button" class="card ${available && !forbidden ? "" : "unavailable"}" data-id="${esc(inc.id)}" style="--c:${schoolColor(inc)}"
             ${title ? `title="${esc(title)}"` : ""}>
-      <h3>${isFavorite(inc.id) ? `<span class="favorite-mark" title="Favorite">♥</span> ` : ""}${esc(inc.name)}</h3>
+      <h3>${isFavorite(inc.id) ? `<span class="favorite-mark" title="Favorite">${icon("heart", "filled")}</span> ` : ""}${esc(inc.name)}</h3>
       <div class="school-line">${schoolLine(inc)}</div>
       <p class="summary">${esc(inc.summary)}</p>
       ${state.book?.all ? spellBookList(entry) : ""}
@@ -1692,8 +1753,8 @@ function spellCard(entry) {
       <dl class="quick-stats">${rows.map(([e, v]) => `<dt>${esc(e)}</dt><dd title="${esc(v)}">${esc(v)}</dd>`).join("")}</dl>
       <div class="card-footer">
         ${components(inc)}
-        ${preparedCopies(inc.id) ? `<span class="prepared-badge" title="Prepared copies">✦ ${preparedCopies(inc.id)}</span>` : ""}
-        ${scrollCount(inc.id) ? `<span class="scroll-badge" title="Scrolls">📜 ${scrollCount(inc.id)}</span>` : ""}
+        ${preparedCopies(inc.id) ? `<span class="prepared-badge" title="Prepared copies">${icon("sparkle")}${preparedCopies(inc.id)}</span>` : ""}
+        ${scrollCount(inc.id) ? `<span class="scroll-badge" title="Scrolls">${icon("scroll")}${scrollCount(inc.id)}</span>` : ""}
         ${forbidden ? `<span class="forbidden-badge">Forbidden</span>` : ""}
         <span class="spacer"></span>
         <span class="card-source">${esc(shortSource(inc))} <span class="card-pages">· ${pages(entry.level)} pg.</span></span>
@@ -1892,7 +1953,7 @@ function toggleFavorite(id) {
 function favoriteButton(inc) {
   const on = isFavorite(inc.id);
   return `<button type="button" class="favorite-button" data-favorite="${esc(inc.id)}" aria-pressed="${on}"
-            title="${on ? "Favorite: click to remove it" : "Mark as favorite"}" aria-label="${esc(inc.name)}: favorite">${on ? "♥" : "♡"}</button>`;
+            title="${on ? "Favorite: click to remove it" : "Mark as favorite"}" aria-label="${esc(inc.name)}: favorite">${icon("heart")}</button>`;
 }
 
 // Favorites first, then by name
@@ -2276,10 +2337,10 @@ function renderClassBlock(block, cls) {
     }
     specDomain.hidden = spec?.type !== "domain";
     if (spec?.type === "domain" && document.activeElement !== specDomain) specDomain.value = spec.name || "";
-    block.querySelector("[data-spec-note]").textContent = !spec ? "no extra slot"
+    block.querySelector("[data-spec-note]").innerHTML = !spec ? "no extra slot"
       : spec.type === "school" ? "+1 spell per level, 0–9"
-      : cls.tradition === "divine" ? "+1 domain spell per level, 1–9 · ★ marks domain spells"
-      : "+1 spell per level, 0–9 · ★ marks domain spells";
+      : cls.tradition === "divine" ? `+1 domain spell per level, 1–9 · ${icon("star", "filled")} marks domain spells`
+      : `+1 spell per level, 0–9 · ${icon("star", "filled")} marks domain spells`;
   }
   const forbidden = cls.forbidden_schools || [];
   for (const chip of block.querySelectorAll("[data-forbid]")) {
@@ -2299,7 +2360,7 @@ function renderClassBlock(block, cls) {
     box.className = `slot ${spontaneous ? "" : levelState(l)} ${l.tooLow && l.base ? "blocked" : ""} ${l.reachable ? "" : "off"}`;
     const pieces = [
       l.bonus ? `+${l.bonus}<span class="wide-only"> bonus</span>` : "",
-      l.special ? `<span class="star" title="${esc(specializationName(cls))} slot">+1★</span>` : "",
+      l.special ? `<span class="star" title="${esc(specializationName(cls))} slot">+1${icon("star", "filled")}</span>` : "",
     ].filter(Boolean);
     box.querySelector(".calc").innerHTML = !l.reachable ? ""
       : l.tooLow ? `needs ${10 + l.n}`
@@ -2344,7 +2405,7 @@ function preparationSection(l, cls) {
         <div>
           <h2>${esc(title)}</h2>
           <div class="level-info">${l.cast} cast · ${Math.max(0, l.prepared - l.cast)} ready${l.dc ? ` · DC ${l.dc}` : ""}${l.bonus ? ` · ${l.base} + ${l.bonus} bonus` : ""}</div>
-          ${l.special ? `<div class="level-note ${tooManyOutsideSpecialization(l) ? "error" : l.fitting ? "ok" : ""}">★ ${esc(specializationName(cls))} slot: ${
+          ${l.special ? `<div class="level-note ${tooManyOutsideSpecialization(l) ? "error" : l.fitting ? "ok" : ""}">${icon("star", "filled")} ${esc(specializationName(cls))} slot: ${
             tooManyOutsideSpecialization(l) ? `only ${l.slot - l.special} other spells allowed`
             : l.fitting ? "filled" : "empty"}</div>` : ""}
           ${l.uncastable ? `<div class="level-note error">${l.uncastable} metamagic spell${l.uncastable === 1 ? "" : "s"} can't be cast</div>` : ""}
@@ -2394,7 +2455,7 @@ function renderDay(classes) {
       ${t.anyPrepared ? `<div class="day-counter"><span class="value">${Math.max(0, t.prepared - t.castPrepared)}</span><span class="label">Ready</span></div>` : ""}
     </div>
     <div class="day-actions">
-      <button class="button" type="button" id="new-day" ${everything.cast ? "" : "disabled"}>☾ New day</button>
+      <button class="button" type="button" id="new-day" ${everything.cast ? "" : "disabled"}>${icon("moon")}New day</button>
       ${t.anyPrepared ? `<button class="button danger" type="button" id="clear-prepared" ${t.prepared ? "" : "disabled"}>Clear all</button>` : ""}
     </div>`;
 }
@@ -2408,11 +2469,11 @@ function specializationStar(inc, fits, level, cls) {
   const spec = cls.specialization;
   if (!spec || !specialSlot(level, cls)) return ""; // no special slot at this level
   const name = esc(specializationName(cls));
-  if (fits === "auto") return `<span class="row-star fixed" title="${name} spell: fits the ${name} slot">★</span>`;
+  if (fits === "auto") return `<span class="row-star fixed" title="${name} spell: fits the ${name} slot">${icon("star", "filled")}</span>`;
   if (spec.type !== "domain") return "";
   return `<button type="button" class="row-star" data-special="${esc(inc.id)}" aria-pressed="${fits === "manual"}"
             title="${fits ? `Marked as a ${name} domain spell` : `Mark as a ${name} domain spell`}"
-            aria-label="${esc(inc.name)}: ${name} domain spell">${fits ? "★" : "☆"}</button>`;
+            aria-label="${esc(inc.name)}: ${name} domain spell">${icon("star", fits ? "filled" : "")}</button>`;
 }
 
 const UNAVAILABLE_NOTE = "Its spellbook is not available: no new copies can be prepared.";
@@ -2966,7 +3027,7 @@ function renderScrolls() {
         <div class="day-counter"><span class="value">${esc(coins(totals.value))}</span><span class="label">Market value</span></div>
       </div>
       ${classes.length ? `<div class="day-actions">
-        <button class="button" type="button" id="open-cart">✚ Add scrolls</button>
+        <button class="button" type="button" id="open-cart">${icon("plus")}Add scrolls</button>
       </div>` : ""}`;
   const dayBox = $("#scroll-day");
   if (patchMemory.get(dayBox)?.html !== day) {
@@ -3163,7 +3224,7 @@ function cartRow(i, totals, multi) {
     <li class="cart-row ${n ? "chosen" : ""} ${blocked ? "blocked" : ""}" style="--c:${schoolColor(i.entry.spell)}">
       <div class="cart-info">
         <span class="cart-name"><button type="button" class="ref" data-cart-open="${esc(i.entry.spell.id)}">${esc(i.entry.spell.name)}</button>
-          ${multi ? `<span class="finder-tag">${esc(i.cls.name)}</span>` : ""}${isFavorite(i.entry.spell.id) ? ` <span class="favorite-mark" title="Favorite">♥</span>` : ""}</span>
+          ${multi ? `<span class="finder-tag">${esc(i.cls.name)}</span>` : ""}${isFavorite(i.entry.spell.id) ? ` <span class="favorite-mark" title="Favorite">${icon("heart", "filled")}</span>` : ""}</span>
         <span class="cart-meta">${esc(levelTitle(i.entry.level, i.cls))} · caster level ${p.casterLevel}${i.owned ? ` · you have ${i.owned}` : ""}</span>
         <span class="cart-prices"><span class="${cart.mode === "buy" ? "current" : ""}">buy ${esc(coins(p.market))}${plus}</span>
           <span class="${cart.mode === "scribe" ? "current" : ""}">scribe ${esc(coins(p.scribeGp))}${plus} + ${p.scribeXp.toLocaleString("en-US")} XP</span></span>
@@ -3873,7 +3934,7 @@ function showSheet(id, { from = null } = {}) {
         <span class="spacer"></span>
         ${from ? `<button class="button" type="button" data-ref="${esc(from)}">← Back</button>` : ""}
         <a class="button" href="${esc(inc.url)}" target="_blank" rel="noopener">dndtools ↗</a>
-        ${$("#add-dialog").open || all || locked ? "" : `<button class="button gold" type="button" id="sheet-add">✚ Add to this book</button>`}
+        ${$("#add-dialog").open || all || locked ? "" : `<button class="button gold" type="button" id="sheet-add">${icon("plus")}Add to this book</button>`}
       </div>`}
     </article>`;
 
@@ -4312,8 +4373,9 @@ function renderDock() {
   const done = running.reduce((sum, job) => sum + job.done, 0);
   const total = running.reduce((sum, job) => sum + job.total, 0);
   toggle.textContent = running.length
-    ? `${jobs.minimized ? "⟳ " : ""}${running.length} running${total ? ` · ${Math.floor((done / total) * 100)}%` : ""}`
+    ? `${running.length} running${total ? ` · ${Math.floor((done / total) * 100)}%` : ""}`
     : `${plural(shown.length, "download")} finished`;
+  toggle.classList.toggle("busy", running.length > 0 && jobs.minimized);
   toggle.setAttribute("aria-expanded", String(!jobs.minimized));
   toggle.title = jobs.minimized ? "Show the downloads" : "Hide the downloads";
   dock.classList.toggle("minimized", jobs.minimized);
@@ -4578,7 +4640,7 @@ function renderFinderForm() {
         <button type="button" class="button ghost" id="finder-reset">Reset filters</button>
         <span class="spacer"></span>
         <button type="button" class="button ghost" data-close>Close</button>
-        <button type="submit" class="button gold" id="finder-go">🔍 Search</button>
+        <button type="submit" class="button gold" id="finder-go">${icon("search")}Search</button>
       </div>
     </form>
     <div id="finder-results" class="finder-results"></div>`;
@@ -4709,7 +4771,7 @@ function renderFinderResults() {
       <label class="finder-all"><input type="checkbox" id="finder-all"> Select all</label>
       <span class="finder-count" id="finder-count"></span>
       <span class="spacer"></span>
-      <button type="button" class="button gold" id="finder-add" disabled>✚ Add to the book</button>
+      <button type="button" class="button gold" id="finder-add" disabled>${icon("plus")}Add to the book</button>
     </div>
     ${finder.stopped ? `<p class="parchment-warning">Search stopped: only the spells found until then are listed.</p>` : ""}
     ${finder.incomplete ? `<p class="parchment-warning">Some result pages could not be loaded from dndtools: search again to complete the list.</p>` : ""}
@@ -4731,7 +4793,7 @@ function updateFinderSelection() {
   $("#finder-count").textContent = `${finder.results.length} found${owned ? ` · ${owned} already in the book` : ""} · ${count} selected`;
   const add = $("#finder-add");
   add.disabled = !count || finder.busy;
-  add.textContent = count ? `✚ Add ${count} spell${count === 1 ? "" : "s"} to the book` : "✚ Add to the book";
+  add.innerHTML = `${icon("plus")}${count ? `Add ${count} spell${count === 1 ? "" : "s"} to the book` : "Add to the book"}`;
 }
 
 async function importFinderSelection() {
@@ -4753,6 +4815,156 @@ async function importFinderSelection() {
     finder.busy = false;
     renderFinderResults();
   }
+}
+
+// ---------- updates from GitHub ----------
+// The server checks GitHub with git (grimoire/updater.py): when main has new commits, the Update button shows in the
+// top bar. Updating backs up the data, installs the new version and restarts the server; the page follows the job,
+// waits for the new server (its /api/instance id changes) and reloads.
+// Without git: Windows downloads it by itself (the page shows the progress), macOS opens Apple's installer once (the
+// page watches until it is done), Linux shows how to install it.
+const update = { info: null, running: false, poll: 0, watchUntil: 0 };
+const GIT_NOTE_KEY = "grimoire-git-note-hidden";
+
+async function checkUpdate(refresh = false) {
+  clearTimeout(update.poll);
+  const before = update.info;
+  try {
+    update.info = await api(`update${refresh ? "?refresh=1" : ""}`);
+  } catch {
+    return; // offline, or a server from before updates: nothing to show
+  }
+  const info = update.info;
+  if (before?.method === "missing" && info.method !== "missing") notify("git is installed: Grimoire can update itself now.");
+  $("#open-update").hidden = !info.available;
+  renderGitNote();
+  if ($("#update-dialog").open && !update.running) renderUpdate();
+  if (info.method !== "missing") return;
+  if (info.git_install?.opened && !before?.git_install?.opened) update.watchUntil = Date.now() + 30 * 60000;
+  if (info.git_install?.running) update.poll = setTimeout(() => checkUpdate(true), 1500);
+  else if (info.git_install?.opened && Date.now() < update.watchUntil) update.poll = setTimeout(() => checkUpdate(true), 5000);
+}
+
+// What the page says when git is missing: the text and the button (Install git, Try again, or none)
+function gitState(info) {
+  const install = info.git_install || {};
+  if (install.running) return { text: `<p class="loading">${esc(install.step || "Getting git")}…</p>`, button: "" };
+  if (install.error) return { text: `<p><b>Automatic updates need git.</b> ${esc(install.error)}</p>`, button: "Try again" };
+  if (install.opened) {
+    return { text: `<p><b>Apple's installer is open.</b> Click Install there: updates work as soon as it is done.</p>`,
+             button: "Open it again" };
+  }
+  return { text: `<p><b>Automatic updates need git.</b> ${esc(info.hint || "")}</p>`,
+           button: info.can_install_git ? "Install git" : "" };
+}
+
+// On the library page: updates need git, and this computer doesn't have it
+function renderGitNote() {
+  const note = $("#git-note");
+  if (!note) return;
+  let hidden = false;
+  try { hidden = localStorage.getItem(GIT_NOTE_KEY) === "1"; } catch { /* storage blocked: shown */ }
+  const info = update.info;
+  note.hidden = hidden || info?.method !== "missing";
+  if (note.hidden) return;
+  const { text, button } = gitState(info);
+  note.innerHTML = `
+    ${text}
+    <div class="git-note-actions">
+      ${button ? `<button type="button" class="button compact" data-install-git>${button}</button>` : ""}
+      <button type="button" class="button ghost compact" data-hide-git-note>Hide</button>
+    </div>`;
+}
+
+function openUpdate() {
+  renderUpdate();
+  $("#update-dialog").showModal();
+  if (!update.info || update.info.error) checkUpdate(true);
+}
+
+function renderUpdate(message = "") {
+  const i = update.info || {};
+  let body, gitButton = "";
+  if (!update.info) body = `<p class="loading">Checking GitHub…</p>`;
+  else if (i.method === "missing") {
+    ({ text: body, button: gitButton } = gitState(i));
+  } else if (i.error) {
+    body = `<p class="form-error">${esc(i.error)}</p>`;
+  } else if (i.blocked) {
+    body = `<p>${esc(i.blocked)}</p>`;
+  } else if (!i.available) {
+    body = `<p>Grimoire is up to date.</p>`;
+  } else if (i.method === "zip") {
+    body = `<p>A new version of Grimoire is on GitHub. This copy was downloaded as a ZIP, so it isn't connected to GitHub
+      yet: <b>Update</b> connects it and installs the latest version. From then on it updates by itself.</p>`;
+  } else {
+    const more = i.behind - i.commits.length;
+    body = `<p>${plural(i.behind, "change")} since your version:</p>
+      <ul class="update-commits">${i.commits.map((c) => `<li><span>${esc(c.message)}</span> <time>${esc(shortDate(c.date))}</time></li>`).join("")}
+        ${more > 0 ? `<li class="update-more">and ${plural(more, "older change")}</li>` : ""}</ul>`;
+  }
+  const ready = i.available && !i.blocked && !i.error;
+  $("#update").innerHTML = `
+    <h2>Update Grimoire</h2>
+    ${body}
+    ${ready ? `<p class="help">Your books and characters are backed up first (in data/backups). Grimoire restarts and this page
+      reloads by itself; phones on the Wi-Fi reconnect.</p>` : ""}
+    <div class="update-progress" id="update-progress" role="status">${message}</div>
+    <div class="form-actions">
+      ${gitButton ? `<button type="button" class="button" data-install-git>${gitButton}</button>` : ""}
+      ${update.info && !ready && i.method !== "missing" ? `<button type="button" class="button ghost" id="update-check">Check again</button>` : ""}
+      <span class="spacer"></span>
+      <button type="button" class="button ghost" data-close>${ready ? "Later" : "Close"}</button>
+      ${ready ? `<button type="button" class="button gold" id="update-now">Update now</button>` : ""}
+    </div>`;
+}
+
+const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function runUpdate() {
+  if (update.running) return;
+  update.running = true;
+  const progress = (text, error = false) => {
+    $("#update-progress").innerHTML = error ? `<p class="form-error">${esc(text)}</p>` : `<p class="loading">${esc(text)}…</p>`;
+  };
+  for (const button of $("#update").querySelectorAll("button")) button.disabled = true;
+  try {
+    const before = (await api("instance")).id;
+    let job = await api("update", { method: "POST", body: {} });
+    while (!job.installed) {  // backing up, downloading, installing: then the server stops
+      if (job.error || job.finished) throw new Error(job.error || "The update stopped.");
+      progress(job.label || "Updating");
+      await pause(500);
+      job = await api(`jobs/${encodeURIComponent(job.id)}`);
+    }
+    progress("Restarting Grimoire");
+    const until = Date.now() + 120000;  // the new version, or the previous one again if the new one didn't start
+    while (Date.now() < until) {
+      await pause(700);
+      try {
+        if ((await api("instance")).id !== before) {
+          location.reload();
+          return;
+        }
+      } catch { /* stopped, not back yet */ }
+    }
+    throw new Error("Grimoire didn't come back after the update: see data/server.log in the grimoire folder.");
+  } catch (error) {
+    update.running = false;
+    renderUpdate();
+    progress(error.message === "Unknown path." ? OUTDATED_SERVER : error.message, true);
+  }
+}
+
+async function installGit() {
+  try {
+    await api("update/install-git", { method: "POST", body: {} });
+  } catch (error) {
+    notify(error.message, true);
+    return;
+  }
+  update.watchUntil = Date.now() + 30 * 60000;  // macOS: Apple's installer takes a few minutes
+  checkUpdate(true);
 }
 
 // ---------- dialog: connect a device ----------
@@ -5115,7 +5327,7 @@ async function restoreSpell(bookId, spellId) {
 }
 
 function forgetWarning(name, bookName) {
-  return `${name} will be deleted from “${bookName}” for good: its level, and the prepared copies, scrolls, favorite and ★ marks it has through this book, are lost (its downloaded page too, if no other book or spell uses it). This can't be undone.`;
+  return `${name} will be deleted from “${bookName}” for good: its level, and the prepared copies, scrolls, favorite and domain marks it has through this book, are lost (its downloaded page too, if no other book or spell uses it). This can't be undone.`;
 }
 
 // Deletes a spell from a book for good (shown or removed) and reloads the open page; returns the book
@@ -5255,7 +5467,6 @@ $("#sheet").addEventListener("click", (event) => {
     toggleFavorite(favorite.dataset.favorite);
     const on = isFavorite(favorite.dataset.favorite);
     favorite.setAttribute("aria-pressed", on);
-    favorite.textContent = on ? "♥" : "♡";
     favorite.title = on ? "Favorite: click to remove it" : "Mark as favorite";
     if (state.view === "prepared") renderPreparation();
     else if (state.view === "scrolls") renderScrolls();
@@ -5414,6 +5625,25 @@ $("#metamagic").addEventListener("input", (event) => {
 loadConditions();
 loadMetamagic();
 pollJobs();
+checkUpdate();
+setInterval(() => checkUpdate(), 30 * 60 * 1000);
+$("#open-update").addEventListener("click", openUpdate);
+$("#update").addEventListener("click", (event) => {
+  if (event.target.closest("#update-now")) runUpdate();
+  if (event.target.closest("#update-check")) {
+    update.info = null;
+    renderUpdate();
+    checkUpdate(true);
+  }
+  if (event.target.closest("[data-install-git]")) installGit();
+});
+app.addEventListener("click", (event) => {
+  if (event.target.closest("[data-install-git]")) installGit();
+  if (event.target.closest("[data-hide-git-note]")) {
+    try { localStorage.setItem(GIT_NOTE_KEY, "1"); } catch { /* not remembered */ }
+    $("#git-note").hidden = true;
+  }
+});
 
 route().catch((error) => {
   app.innerHTML = `<div class="empty dark"><div class="big">The grimoire isn't responding</div><p>${esc(error.message)}</p><p>Is the server running? Start it with the start script in the grimoire folder.</p></div>`;

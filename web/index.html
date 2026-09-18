@@ -22,17 +22,22 @@
 <body>
   <header class="topbar">
     <a class="brand" href="#/">
-      <span class="seal" aria-hidden="true">✦</span>
+      <span class="seal" aria-hidden="true"><svg class="icon" viewBox="0 0 24 24"><path class="solid" d="M12 2.5l2 7.5 7.5 2-7.5 2-2 7.5-2-7.5-7.5-2 7.5-2z"/></svg></span>
       <span class="brand-name">Grimoire</span>
     </a>
     <nav class="breadcrumbs" id="breadcrumbs"></nav>
     <div class="bar-actions">
+      <button class="button update-button" id="open-update" type="button" hidden aria-label="Update Grimoire" title="A new version of Grimoire is available">
+        <svg class="bar-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5M5.5 11.5 12 5l6.5 6.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span class="wide-only-bar">Update</span>
+      </button>
       <button class="button ghost" id="open-connect" type="button" title="Open the grimoire on a phone on the same Wi-Fi">
         <svg class="bar-icon" viewBox="0 0 24 24" aria-hidden="true"><rect x="6.5" y="2.5" width="11" height="19" rx="2.2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M10.5 18.5h3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
         <span class="wide-only-bar">Connect device</span>
       </button>
       <button class="button ghost open-conditions" id="open-conditions" type="button" title="Condition summary (SRD)">
-        <span aria-hidden="true">☍</span><span class="wide-only-bar"> Conditions</span>
+        <svg class="bar-icon icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M10.4 12.8a1.6 1.6 0 0 1 3.2 0a3.2 3.2 0 0 1-6.4 0a4.8 4.8 0 0 1 9.6 0a6.4 6.4 0 0 1-12.8 0a8 8 0 0 1 16 0"/></svg>
+        <span class="wide-only-bar">Conditions</span>
       </button>
     </div>
   </header>
@@ -265,6 +270,10 @@
   </dialog>
 
   <!-- Connect a device (QR code with the address on the home network) -->
+  <dialog id="update-dialog" class="dialog narrow" aria-label="Update Grimoire">
+    <div id="update" class="form"></div>
+  </dialog>
+
   <dialog id="connect-dialog" class="dialog narrow" aria-label="Connect a device">
     <div id="connect" class="form"></div>
   </dialog>
