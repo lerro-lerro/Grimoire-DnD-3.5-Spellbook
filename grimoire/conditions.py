@@ -21,6 +21,11 @@ import lxml.html  # noqa: E402
 from . import units  # noqa: E402
 
 URL = "https://www.d20srd.org/srd/conditionSummary.htm"
+# "Ability Score Loss": what a score of 0 does, ability by ability (the user asked for it in Ability Damaged/Drained)
+ABILITY_LOSS_URL = "https://www.d20srd.org/srd/specialAbilities.htm"
+ABILITY_CONDITIONS = ("abilityDamaged", "abilityDrained")
+ABILITIES = ("Strength", "Dexterity", "Constitution", "Intelligence", "Wisdom", "Charisma")
+FORMAT = 2  # 2: with the ability scores at 0; an older file is downloaded again
 OUTPUT = Path(__file__).resolve().parent.parent / "web" / "conditions.json"
 TEXT_TAGS = {"p", "em", "i", "strong", "b", "a"}
 
@@ -71,7 +76,8 @@ EXCLUDED = ["raise dead", "speak with dead", "dead magic", "stable ground", "sta
 
 
 def clean(paragraph):
-    """HTML of the paragraph with text tags only; links to other conditions become <a data-condition>."""
+    """Inner HTML of the paragraph (or list item) with text tags only; links to other conditions become
+    <a data-condition>."""
     for node in list(paragraph.iter()):
         if node is paragraph:
             continue
@@ -87,7 +93,7 @@ def clean(paragraph):
             else:
                 node.drop_tag()
     html = lxml.html.tostring(paragraph, encoding="unicode")
-    html = re.sub(r"^<p>|</p>$", "", html.strip())
+    html = re.sub(rf"^<{paragraph.tag}>|</{paragraph.tag}>$", "", html.strip())
     return re.sub(r"\s+", " ", html).strip()
 
 
@@ -117,24 +123,58 @@ def parse(html):
     }
 
 
-def stored(path=OUTPUT):
-    """True if the file is there and has every condition."""
+def parse_ability_loss(html):
+    """The "Ability Score Loss" rules of a score at 0, as HTML to add to Ability Damaged and Ability Drained.
+    html: bytes of the SRD special abilities page. ValueError if the section has changed."""
+    root = lxml.html.fromstring(html)
+    heading = root.xpath('//*[@id="abilityScoreLoss"]')
+    items = heading[0].xpath("following-sibling::ul[1]/li") if heading else []
+    lines = [clean(item) for item in items]
+    if [line.split(" ", 1)[0] for line in lines] != list(ABILITIES):
+        raise ValueError("the SRD page has changed: the ability scores at 0 are missing")
+    after = heading[0].xpath("following-sibling::ul[1]/following-sibling::p[1]")
+    return units.convert_text("<h4>An ability score at 0</h4><ul>%s</ul>%s" % (
+        "".join(re.sub(r"^(\w+ 0)", r"<li><strong>\1</strong>", line) + "</li>" for line in lines), f"<p>{clean(after[0])}</p>" if after else ""))
+
+
+def _read(path):
     try:
-        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def stored(path=OUTPUT):
+    """True if the file is there and has every condition (it can be used, even in an older format)."""
+    try:
+        data = _read(path)
         return not set(FORMS) - {c["id"] for c in data["conditions"] if c.get("description_html")}
-    except (OSError, ValueError, TypeError, KeyError):
+    except (TypeError, KeyError):
         return False
+
+
+def current(path=OUTPUT):
+    """True if the file has every condition and is in this FORMAT."""
+    return stored(path) and _read(path).get("format") == FORMAT
+
+
+def _get(url):
+    request = urllib.request.Request(url, headers={"User-Agent": "Grimoire spellbook (personal use)"})
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read()
 
 
 def download():
     """The conditions from the SRD; ValueError if the page has changed, OSError without a connection."""
-    request = urllib.request.Request(URL, headers={"User-Agent": "Grimoire spellbook (personal use)"})
-    with urllib.request.urlopen(request, timeout=30) as response:
-        html = response.read()
-    data = parse(html)
+    data = parse(_get(URL))
     missing = set(FORMS) - {c["id"] for c in data["conditions"]}
     if not data["conditions"] or missing:
         raise ValueError(f"the SRD page has changed: missing {', '.join(sorted(missing)) or 'all conditions'}")
+    at_zero = parse_ability_loss(_get(ABILITY_LOSS_URL))
+    for condition in data["conditions"]:
+        if condition["id"] in ABILITY_CONDITIONS:
+            condition["description_html"] += at_zero
+    data["format"] = FORMAT
     return data
 
 

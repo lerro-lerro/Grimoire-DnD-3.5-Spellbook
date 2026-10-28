@@ -16,6 +16,7 @@ import html
 import json
 import mimetypes
 import os
+import queue
 import re
 import secrets
 import select
@@ -42,7 +43,7 @@ sys.dont_write_bytecode = True  # no __pycache__ next to the data
 if sys.version_info < (3, 9):
     sys.exit("Grimoire needs Python 3.9 or newer.")
 try:
-    from grimoire import conditions, dndtools, metamagic, search, units  # noqa: E402
+    from grimoire import conditions, dndtools, metamagic, monsters, search, units  # noqa: E402
     MISSING_MODULE = None
 except ImportError as missing:  # --stop works without lxml; everything else says what to install
     MISSING_MODULE = missing.name
@@ -52,6 +53,7 @@ APP_DIR = Path(__file__).resolve().parent
 WEB = APP_DIR / "web"
 CONDITIONS_FILE = WEB / "conditions.json"  # the SRD conditions, kept offline
 CONDITIONS_LOCK = threading.Lock()
+CONDITIONS_FAILED = {"at": 0.0}  # when an older conditions file last failed to download again
 METAMAGIC_FILE = WEB / "metamagic.json"  # the dndtools metamagic feats, kept offline
 METAMAGIC_LOCK = threading.Lock()
 METAMAGIC_JOB = {"thread": None, "error": None, "failed_at": 0.0}
@@ -143,6 +145,8 @@ class Store:
         self.characters = Path(data_folder) / "characters"
         for folder in (self.books, self.spells, self.characters):
             folder.mkdir(parents=True, exist_ok=True)
+        # the creatures summoning spells list, from the SRD (<data>/monsters, created on the first download)
+        self.monsters = monsters.Library(Path(data_folder) / "monsters")
         # spell files are renamed when a level changes: reads, writes and renames of spell files take turns
         self.spell_lock = threading.RLock()
         self._spell_paths, self._scanned = {}, None
@@ -219,6 +223,18 @@ class Store:
                 self.generation += 1  # changed outside the app
             self._sheets[spell_id] = (path, mtime, data)
             return data
+
+    def spells_named(self, name, exclude=None):
+        """IDs of the saved sheets with this name (case and apostrophes ignored; "greater X" also finds
+        "X, Greater"), looked up through the file names."""
+        variants = dndtools.name_variants(name)
+        names, slugs = {v.lower() for v in variants}, {spell_slug(v) for v in variants}
+        with self.spell_lock:
+            self._scan_spells()
+            candidates = [spell_id for spell_id, path in self._spell_paths.items()
+                          if spell_id != exclude and (SPELL_FILE_RE.match(path.stem) or {"slug": None})["slug"] in slugs]
+            return [spell_id for spell_id in candidates
+                    if (self.spell(spell_id) or {}).get("name", "").replace("’", "'").lower() in names]
 
     def save_spell(self, data):
         with self.spell_lock:
@@ -397,14 +413,22 @@ class Store:
 
 def ensure_conditions():
     """The conditions are used offline from CONDITIONS_FILE: when it is missing or incomplete they are downloaded
-    from the SRD and saved. Returns None when the file is ready, otherwise why it isn't."""
+    from the SRD and saved. A file in an older format is downloaded again too, but used as it is when that fails
+    (tried again at most every 10 minutes). Returns None when the file is ready, otherwise why it isn't."""
     with CONDITIONS_LOCK:
-        if conditions.stored(CONDITIONS_FILE):
+        if conditions.current(CONDITIONS_FILE):
+            return None
+        usable = conditions.stored(CONDITIONS_FILE)
+        if usable and time.time() - CONDITIONS_FAILED["at"] < 600:
             return None
         try:
             data = conditions.download()
             conditions.save(data, CONDITIONS_FILE)
         except Exception as error:  # no connection, the SRD page has changed, the folder is read-only…
+            if usable:
+                CONDITIONS_FAILED["at"] = time.time()
+                print(f"The conditions could not be updated from the SRD ({error}): the saved ones are used.", flush=True)
+                return None
             return f"The conditions are not saved yet and could not be downloaded from the SRD ({error})."
         print(f"Downloaded {len(data['conditions'])} conditions from the SRD to {CONDITIONS_FILE.name}.", flush=True)
         return None
@@ -980,6 +1004,30 @@ def resolve_base_name(store, data):
     return data
 
 
+def link_handwritten_base(store, data, preferred=()):
+    """"This spell functions like call undead I, except…" in a hand-written spell: the base is looked up by name
+    among the saved sheets (hand-written and removed ones too; the IDs in `preferred` first), then on dndtools
+    (downloaded with the spells it references). When found, its name becomes clickable and the sheet borrows
+    its missing stats and components, as the dndtools sheets do. Call it without LOCK: the search can be slow."""
+    name = dndtools.unlinked_base_name(data["description_html"])
+    data = {**data, "references": [], "based_on": None, "based_on_name": name}
+    if not name:
+        return data
+    found = store.spells_named(name, exclude=data["id"])
+    base_id = min(found, key=lambda spell_id: spell_id not in preferred) if found else None
+    if not base_id:
+        try:
+            url = dndtools.search_spell(name)
+            base_id = download_with_linked(store, url)["id"] if url else None
+        except dndtools.DndtoolsError as error:
+            print(f"Base spell “{name}” not searched: {error}", file=sys.stderr)
+    base = store.spell(base_id) if base_id else None
+    if not base:
+        return data
+    return {**data, "based_on": base_id, "references": [{"id": base_id, "name": base["name"], "url": base.get("url", "")}],
+            "description_html": dndtools.link_name(data["description_html"], name, base_id)}
+
+
 def download_with_linked(store, url, force=False):
     """Downloads a sheet (if it isn't cached, or if force) and the spells it references.
     Sheets saved before references existed are downloaded again."""
@@ -1041,6 +1089,81 @@ def merge_base(data, sheets):
     if chain:
         result["inherited_from"] = {"chain": chain, "keys": keys}
     return result
+
+
+def creature_lists(store, data):
+    """The creature lists of a sheet and of the spells it is based on (Summon Monster II also lists the
+    1st-level creatures of Summon Monster I): [{id, name, items}], see monsters.list_items."""
+    groups, seen, sheet = [], set(), data
+    while sheet and sheet["id"] not in seen:
+        seen.add(sheet["id"])
+        items = monsters.list_items(sheet)
+        if items:
+            groups.append({"id": sheet["id"], "name": sheet["name"], "items": items})
+        sheet = store.spell(sheet["based_on"]) if sheet.get("based_on") else None
+    return groups
+
+
+def spell_by_name(store, name):
+    """The completed sheet of a spell named in a creature's text ("detect evil"): a saved one (dndtools rather than
+    hand-written, the Player's Handbook 3.5, then any 3.5 rulebook), otherwise found on dndtools and downloaded
+    (with the spells it references) like a preview. 404 when dndtools has no such spell."""
+    name = re.sub(r"\s+", " ", str(name or "")).strip()[:80]
+    if not name:
+        raise ApiError(HTTPStatus.BAD_REQUEST, "Which spell?")
+    sheets = [store.spell(spell_id) for spell_id in store.spells_named(name)]
+    sheets = [s for s in sheets if s]
+    if sheets:
+        data = min(sheets, key=lambda s: (bool(s.get("handwritten")), s.get("rulebook") != "Player's Handbook v.3.5",
+                                          not s.get("edition_35"), s["id"]))
+    else:
+        url = dndtools.search_spell(name)
+        if not url:
+            raise ApiError(HTTPStatus.NOT_FOUND, f"dndtools has no spell called “{name}”.")
+        data = download_with_linked(store, url)
+    return completed_spell(store, data["id"])
+
+
+def spell_creatures(store, spell_id):
+    """The creatures a spell can summon, with their SRD sheets and the rules of their types and subtypes
+    (downloaded the first time, then read from <data>/monsters). `error` says why they couldn't be downloaded."""
+    data = store.spell(spell_id)
+    if data is None:
+        raise KeyError(spell_id)
+    groups = creature_lists(store, data)
+    if not groups:
+        return {"groups": [], "creatures": {}, "types": {}}
+    try:
+        groups, creatures, types = store.monsters.resolve(groups)
+    except monsters.MonsterError as error:
+        return {"groups": groups, "creatures": {}, "types": {}, "error": f"The creatures could not be downloaded: {error}"}
+    return {"groups": groups, "creatures": creatures, "types": types}
+
+
+CREATURE_QUEUE = queue.Queue()
+CREATURE_WORKER = {"thread": None, "error": None}
+
+
+def fetch_creatures_later(store, spell_ids):
+    """Downloads in the background the creatures of the spells that summon from a list, one spell at a time
+    (after an add, an edit, a refresh, and at startup for the spells in the books)."""
+    for spell_id in spell_ids:
+        CREATURE_QUEUE.put((store, spell_id))
+    if CREATURE_WORKER["thread"] is None:
+        CREATURE_WORKER["thread"] = threading.Thread(target=_fetch_creatures, daemon=True)
+        CREATURE_WORKER["thread"].start()
+
+
+def _fetch_creatures():
+    while not STOPPING.is_set():
+        store, spell_id = CREATURE_QUEUE.get()
+        try:
+            error = spell_creatures(store, spell_id).get("error")
+        except Exception as problem:  # noqa: BLE001 — the loop must keep going for the next spells
+            error = f"Creatures of spell {spell_id} not downloaded: {problem}"
+        if error and error != CREATURE_WORKER["error"]:  # offline: said once, not for every spell
+            print(error, file=sys.stderr, flush=True)
+        CREATURE_WORKER["error"] = error or CREATURE_WORKER["error"]
 
 
 def completed_spell(store, spell_id):
@@ -1412,6 +1535,7 @@ def import_spells(store, book_id, urls, job):
             data = download_with_linked(store, url)
             if STOPPING.is_set():
                 return
+            fetch_creatures_later(store, [data["id"]])
             with LOCK:
                 book = store.book(book_id)
                 if book.get("unavailable"):
@@ -1634,6 +1758,12 @@ def make_handler(store, network, control=None):
                         raise ApiError(HTTPStatus.SERVICE_UNAVAILABLE, error)
                     self._send_file(file, "application/json; charset=utf-8")
                     return
+            if relative.startswith("monster-images/"):  # pictures of the creatures, in <data>/monsters/images
+                file = store.monsters.image_file(relative.removeprefix("monster-images/"))
+                if not file:
+                    raise ApiError(HTTPStatus.NOT_FOUND, "No such picture.")
+                self._send_file(file, mimetypes.guess_type(file.name)[0] or "application/octet-stream")
+                return
             file = (WEB / relative).resolve()
             if WEB not in file.parents or not file.is_file():
                 file = WEB / "index.html"
@@ -1778,6 +1908,9 @@ def make_handler(store, network, control=None):
                         raise ApiError(HTTPStatus.BAD_REQUEST, "Send the request as JSON.")
                     return network.open()
 
+            if parts == ["spell-by-name"] and method == "POST":
+                return spell_by_name(store, self._body().get("name"))
+
             if parts == ["preview"] and method == "POST":
                 return self._preview(self._body())
 
@@ -1836,7 +1969,10 @@ def make_handler(store, network, control=None):
                 sheet = completed_spell(store, parts[1])
                 if sheet is None:
                     raise KeyError(parts[1])
-                return sheet
+                return {**sheet, "has_creatures": bool(creature_lists(store, store.spell(parts[1])))}
+
+            if len(parts) == 3 and parts[0] == "spells" and parts[2] == "creatures" and method == "GET":
+                return spell_creatures(store, parts[1])
 
             if len(parts) == 2 and parts[0] == "spells" and method == "PUT":
                 return self._edit_handwritten(parts[1], self._body())
@@ -1848,6 +1984,7 @@ def make_handler(store, network, control=None):
                 if old.get("handwritten"):
                     raise ApiError(HTTPStatus.BAD_REQUEST, "This spell was written by hand: edit it instead.")
                 fresh = download_with_linked(store, old["url"], force=True)
+                fetch_creatures_later(store, [fresh["id"]])
                 return expand_spell(store, fresh)
 
             raise ApiError(HTTPStatus.NOT_FOUND, "Unknown path.")
@@ -2023,8 +2160,9 @@ def make_handler(store, network, control=None):
             return character_summary(character, books)
 
         def _save_scrolls(self, character_id, body):
-            """Replaces the character's scrolls: [{id, class, count}], one entry per spell of a class, count 1-99
-            (the class decides the scroll's caster level and whether it is arcane or divine)."""
+            """Replaces the character's scrolls: [{id, class, count, caster_level?}], one entry per spell of a class
+            and caster level, count 1-99. The class decides whether the scroll is arcane or divine and its minimum
+            caster level (worked out by the interface): `caster_level` (1-20) is only there for a higher one."""
             entries = body.get("scrolls")
             if not isinstance(entries, list):
                 raise ApiError(HTTPStatus.BAD_REQUEST, "Scrolls must be a list.")
@@ -2041,9 +2179,14 @@ def make_handler(store, network, control=None):
                     if str(entry.get("id")) not in by_class.get(class_key_, ()):
                         continue
                     count = bounded_number(entry.get("count", 0), 0, 99, "The number of scrolls must be a number.")
+                    caster_level = entry.get("caster_level")
+                    if caster_level not in (None, ""):
+                        caster_level = bounded_number(caster_level, 1, 20, "The caster level of a scroll must be 1-20.")
                     if count:
-                        scrolls[(class_key_, str(entry["id"]))] = count
-                character["scrolls"] = ([{"id": i, "class": k, "count": c} for (k, i), c in scrolls.items()]
+                        key = (class_key_, str(entry["id"]), caster_level or None)
+                        scrolls[key] = count
+                character["scrolls"] = ([{"id": i, "class": k, "count": c, **({"caster_level": cl} if cl else {})}
+                                         for (k, i, cl), c in scrolls.items()]
                                         + hidden_entries(character.get("scrolls", []), books))
                 store.save_character(character)
             return character_summary(character, books)
@@ -2080,6 +2223,7 @@ def make_handler(store, network, control=None):
 
         def _add_handwritten(self, book_id, body):
             data = handwritten_sheet(body["sheet"])
+            data = link_handwritten_base(store, data, {v["id"] for v in store.book(book_id).get("spells", [])})
             with LOCK:
                 book = store.book(book_id)
                 ensure_available(book)
@@ -2096,20 +2240,24 @@ def make_handler(store, network, control=None):
                 store.save_spell(data)
                 book["spells"].append({"id": data["id"], "level": level, "added_at": now()})
                 store.save_book(book)
+            fetch_creatures_later(store, [data["id"]])
             return full_book(store, book), HTTPStatus.CREATED
 
         def _edit_handwritten(self, spell_id, body):
+            previous = store.spell(spell_id)
+            if not previous:
+                raise KeyError(spell_id)
+            if not previous.get("handwritten"):
+                raise ApiError(HTTPStatus.BAD_REQUEST, "Only hand-written spells can be edited: use “Refresh from dndtools”.")
+            holders = [b for b in store.all_books() if any(v["id"] == spell_id for v in b.get("spells", []))]
+            if holders and all(b.get("unavailable") for b in holders):
+                ensure_available(holders[0])
+            data = handwritten_sheet(body.get("sheet"), previous)
+            # the base is looked up outside LOCK (it can be searched on dndtools)
+            data = link_handwritten_base(store, data, {v["id"] for b in holders for v in b.get("spells", [])})
             with LOCK:
-                previous = store.spell(spell_id)
-                if not previous:
-                    raise KeyError(spell_id)
-                if not previous.get("handwritten"):
-                    raise ApiError(HTTPStatus.BAD_REQUEST, "Only hand-written spells can be edited: use “Refresh from dndtools”.")
-                holders = [b for b in store.all_books() if any(v["id"] == spell_id for v in b.get("spells", []))]
-                if holders and all(b.get("unavailable") for b in holders):
-                    ensure_available(holders[0])
-                data = handwritten_sheet(body.get("sheet"), previous)
                 store.save_spell(data)
+            fetch_creatures_later(store, [data["id"]])
             return expand_spell(store, data)
 
         def _add(self, book_id, body):
@@ -2128,6 +2276,7 @@ def make_handler(store, network, control=None):
                     level = level_for_book(store, book, data)[0] if level is None else level
                     book["spells"].append({"id": data["id"], "level": level, "added_at": now()})
                 store.save_book(book)
+            fetch_creatures_later(store, [data["id"]])
             return full_book(store, book), HTTPStatus.CREATED
 
         def _change_level(self, book_id, spell_id, body):
@@ -2666,6 +2815,8 @@ def main():
 
     threading.Thread(target=fetch_conditions, daemon=True).start()
     ensure_metamagic()
+    # the creatures of the summoning spells in the books (only what isn't saved yet is downloaded)
+    fetch_creatures_later(store, sorted({entry["id"] for book in store.all_books() for entry in shown(book.get("spells", []))}))
     renamed = store.name_spell_files()
     if renamed:
         print(f"Renamed {renamed} spell file{'s' if renamed != 1 else ''} to <level>-<name>--<id>.json.")

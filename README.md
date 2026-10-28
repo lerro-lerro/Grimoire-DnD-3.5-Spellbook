@@ -23,7 +23,9 @@ converted to metric, and keeps it on your computer.
 - **Stay tidy:** favorites, folding levels, **Select** to remove many spells at once (with Undo), a list of removed
   spells you can restore, and books you can mark as lost or stolen.
 - **Rules at hand:** the full text of every spell. Conditions like *stunned* are clickable and open the d20 SRD
-  rules.
+  rules. Summoning spells (Summon Monster, Summon Undead…) show the full SRD sheet of every creature they can
+  bring, with its Monster Manual picture (or a photo, for real animals) and the rules of its type and subtypes
+  (undead, incorporeal…), saved for offline use.
 - **Phone:** the page is made for phones too, and a QR code opens it from any device on your Wi-Fi.
 
 ## What you need
@@ -106,7 +108,7 @@ files, your own commits, another branch) is never updated automatically: update 
 
 ## Your data
 
-Books, characters and downloaded spells are JSON files in the `data/` folder, created on the first start. It is
+Books, characters, downloaded spells and creatures are JSON files in the `data/` folder, created on the first start. It is
 not part of the repository, and updates never touch it. To back everything up, copy that folder.
 
 ## Problems?
@@ -137,7 +139,7 @@ Without the scripts: `python3 -m pip install -r requirements.txt`, then `python3
 
 ```
 server.py      the web server and its API (start here)
-grimoire/      dndtools download and search, metric units, SRD conditions, metamagic feats, updates
+grimoire/      dndtools download and search, metric units, SRD conditions and creatures, metamagic feats, updates
 web/           the interface: HTML, CSS and JavaScript, no build step
 start-*        start scripts for Windows, macOS and Linux (stop-* stop the server)
 ```
@@ -148,6 +150,9 @@ Python standard library plus lxml, and plain JavaScript: nothing to build.
 
 - Spell and feat data: [dndtools.net](https://dndtools.net). It is downloaded to your computer when you use the
   app and is not included in this repository.
-- Conditions: the d20 System Reference Document ([d20srd.org](https://www.d20srd.org)), Open Game License.
+- Conditions and creatures: the d20 System Reference Document ([d20srd.org](https://www.d20srd.org)), Open Game License.
+- Monster pictures: the Monster Manual v.3.5 art gallery by Wizards of the Coast (2003), through the
+  [Internet Archive](https://web.archive.org); animal photos from [Wikipedia](https://en.wikipedia.org). They are
+  downloaded to your computer when used and are not included in this repository.
 - Dungeons & Dragons is a trademark of Wizards of the Coast. This is an unofficial fan project, not affiliated
   with or endorsed by Wizards of the Coast.

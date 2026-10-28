@@ -1507,6 +1507,73 @@ button.row-star[aria-pressed="true"] { color: #fff8e6; background: var(--gold-da
 .base-spell h3 .ref { font-family: var(--body-font); font-size: 1.15rem; }
 .base-spell .description { font-size: .98rem; }
 .base-spell .description p.first::first-letter { font-size: inherit; float: none; margin: 0; color: inherit; font-family: inherit; }
+.creatures { margin-top: 1.6rem; }
+.creatures h3 { margin: 0 0 .5rem; font-family: var(--title-font); font-size: 1rem; letter-spacing: .04em; }
+.creature-source { margin: 1.1rem 0 .3rem; font-family: var(--title-font); font-size: .85rem; letter-spacing: .04em; color: var(--ink-faint); }
+.creature-heading { margin: .7rem 0 .35rem; font-style: italic; color: var(--ink-faint); }
+.creature-list { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: .4rem; }
+.creature-chip {
+  display: flex;
+  align-items: center;
+  gap: .6rem;
+  min-height: 44px;
+  padding: .35rem .7rem;
+  border: 1px solid rgba(107, 88, 66, .3);
+  border-radius: 8px;
+  background: rgba(255, 252, 243, .45);
+  color: var(--ink);
+  font: inherit;
+  text-align: left;
+}
+button.creature-chip { cursor: pointer; }
+@media (hover: hover) { button.creature-chip:hover { border-color: var(--gold-dark); background: rgba(255, 252, 243, .8); } }
+.creature-chip img { flex: none; width: 40px; height: 40px; object-fit: cover; object-position: top; border-radius: 6px; }
+.creature-chip > span { display: flex; flex-direction: column; min-width: 0; }
+.creature-chip small { color: var(--ink-faint); font-size: .82rem; }
+.creature-chip.missing { color: var(--ink-faint); }
+.creature-chip.missing small { font-style: italic; }
+.creature-name { font-weight: 600; }
+.creature-kind { margin: .2rem 0 .9rem; color: var(--ink-faint); font-style: italic; }
+.creature-part {
+  margin: .6rem 0 0;
+  border: 1px solid rgba(107, 88, 66, .3);
+  border-radius: 8px;
+  background: rgba(255, 252, 243, .45);
+}
+.creature-part > summary {
+  padding: .55rem .8rem;
+  cursor: pointer;
+  font-family: var(--title-font);
+  font-size: .8rem;
+  letter-spacing: .04em;
+  color: var(--gold-dark);
+}
+.creature-part[open] > summary { border-bottom: 1px solid rgba(107, 88, 66, .2); }
+.creature-part > .description { padding: .6rem .8rem .2rem; }
+.creature-sheet .description { font-size: .95rem; }
+.creature-sheet .description p.first::first-letter { font-size: inherit; float: none; margin: 0; color: inherit; font-family: inherit; }
+.creature-sheet .description :is(h2, h3, h4, h5, h6) { margin: .9rem 0 .2rem; font-family: var(--title-font); font-size: .85rem; letter-spacing: .04em; }
+.creature-sheet .description th { white-space: nowrap; }
+.creature-sheet .sheet-actions { margin-top: 1rem; }
+.creature-art { display: flex; flex-wrap: wrap; gap: .8rem; margin: 0 0 .8rem; }
+.creature-art figure { display: flex; flex-direction: column; max-width: 100%; margin: 0; }
+.creature-art img { display: block; width: auto; max-width: 100%; height: auto; max-height: 360px; border-radius: 8px; }
+.creature-art figcaption {
+  max-width: 320px;
+  margin-top: .3rem;
+  font-size: .82rem;
+  font-style: italic;
+  color: var(--ink-faint);
+  line-height: 1.35;
+}
+@media (max-width: 700px) {
+  .creature-art figure { width: 100%; align-items: center; }
+  .creature-art img { max-height: 60vh; }
+  .creature-art figcaption { max-width: none; align-self: stretch; }
+}
+@media (pointer: coarse) {
+  .creature-part > summary { min-height: 44px; display: flex; align-items: center; }
+}
 .card-base { font-size: .9rem; color: var(--ink-faint); }
 .card-base .ref { padding: .2rem 0; }
 .not-in-book { font-style: italic; color: var(--ink-faint); }
@@ -2015,6 +2082,42 @@ button.row-star[aria-pressed="true"] { color: #fff8e6; background: var(--gold-da
 .scroll-price .cost-note { font-style: italic; }
 .scroll-price .scroll-total { color: var(--ink); }
 .scroll-help { margin: 0 0 1.4rem; }
+/* scrolls above the minimum caster level, under the row of the spell */
+.scroll-levels { grid-column: 1 / -1; display: flex; flex-direction: column; gap: .3rem; }
+.scroll-level {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: .2rem .8rem;
+  padding: .25rem 0 .25rem .8rem;
+  border-left: 2px solid rgba(138, 106, 38, .45);
+  font-size: .85rem;
+  color: var(--ink-faint);
+}
+.scroll-level-name { font-family: var(--title-font); font-size: .8rem; letter-spacing: .04em; color: var(--ink); }
+.scroll-level-prices { flex: 1 1 14rem; }
+.scroll-level-prices b { color: var(--ink); }
+.scroll-level .stepper { margin-left: auto; }
+/* "+ caster level": a small menu under the prices, for scrolls at a higher caster level */
+.scroll-level-add {
+  max-width: 100%;
+  margin-top: .15rem;
+  padding: .05rem .1rem;
+  -webkit-appearance: none;
+  appearance: none;
+  border: 0;
+  border-bottom: 1px dotted var(--gold-dark);
+  border-radius: 0;
+  background: transparent;
+  color: var(--gold-dark);
+  font: inherit;
+  font-size: .8rem;
+  cursor: pointer;
+}
+@media (pointer: coarse) {
+  .scroll-level-add { min-height: 44px; font-size: 16px; }
+  .scroll-level .stepper button { width: 2.75rem; height: 2.75rem; }
+}
 @media (max-width: 420px) {
   /* three tabs and "All →" in one row: the count goes below the label */
   .book-tabs { gap: .2rem; }
@@ -2111,6 +2214,9 @@ button.row-star[aria-pressed="true"] { color: #fff8e6; background: var(--gold-da
 .cart-prices { display: flex; flex-wrap: wrap; gap: 0 .9rem; }
 .cart-prices .current, .cart-totals .current { color: var(--gold-light); }
 .cart-note { font-size: .85rem; font-style: italic; color: #f4c9c0; }
+.form .cart-cl { display: inline-flex; flex-direction: row; align-items: center; gap: .3rem; font-size: inherit; color: inherit; }
+.form .cart-cl select { width: auto; padding: .15rem .4rem; }
+@media (pointer: coarse) { .form .cart-cl select { min-height: 2.75rem; font-size: 16px; } }
 .cart-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: .5rem .7rem; margin-left: auto; }
 .cart-line { font-size: .9rem; white-space: nowrap; }
 .cart-row .stepper { border-color: rgba(232, 207, 138, .35); }

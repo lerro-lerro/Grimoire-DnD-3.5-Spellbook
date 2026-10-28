@@ -243,7 +243,7 @@
       </div>
       <label>Description
         <textarea name="description" rows="10" maxlength="30000" placeholder="A shimmering red barrier surrounds the subject…"></textarea>
-        <small>Press Enter after a sentence to start a new paragraph. Lines like “Material Component: …” are shown as separate notes, and conditions such as stunned or blinded become links.</small>
+        <small>Press Enter after a sentence to start a new paragraph. Lines like “Material Component: …” are shown as separate notes, conditions such as stunned or blinded become links, and “This spell functions like <i>spell name</i>, except…” links to that spell (one you saved, hand-written too, or one on dndtools): the stats and components you leave empty come from it.</small>
       </label>
       <p class="form-error" id="handwritten-error" hidden></p>
       <div class="form-actions">
@@ -286,6 +286,16 @@
   <!-- Conditions (SRD) -->
   <dialog id="condition-dialog" class="dialog condition-dialog" aria-label="Condition">
     <div id="condition"></div>
+  </dialog>
+
+  <!-- A creature that a summoning spell lists (SRD), above the spell sheet -->
+  <dialog id="creature-dialog" class="dialog condition-dialog creature-dialog" aria-label="Creature">
+    <div id="creature"></div>
+  </dialog>
+
+  <!-- A spell named in a creature's text (read only), above the creature -->
+  <dialog id="spell-ref-dialog" class="dialog sheet-dialog spell-ref-dialog" aria-label="Spell">
+    <div id="spell-ref"></div>
   </dialog>
 
   <!-- Confirmation -->

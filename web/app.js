@@ -2783,9 +2783,11 @@ app.addEventListener("change", (event) => {
 
 // ---------- scrolls ----------
 // Scroll prices (SRD, Creating Magic Items): spell level × caster level × 25 gp, with a cantrip counting as ½ level.
-// The caster level is the lowest that can cast the spell in the scriber's class; costly material components are
-// added at their value and XP costs at 5 gp per XP (a focus isn't used up, so it isn't added). Scribing a scroll
-// yourself costs half the base price in gp and 1/25 of it in XP, plus the full component costs.
+// The caster level is at least the lowest that can cast the spell in the scriber's class, and can be higher (up to
+// MAX_SCROLL_CASTER_LEVEL: a stronger scroll, at a higher price); costly material components are added at their value
+// and XP costs at 5 gp per XP (a focus isn't used up, so it isn't added). Scribing a scroll yourself costs half the
+// base price in gp and 1/25 of it in XP, plus the full component costs.
+const MAX_SCROLL_CASTER_LEVEL = 20;
 const SCROLL_CASTER_LEVELS = {
   wizard: [1, 1, 3, 5, 7, 9, 11, 13, 15, 17],  // cleric, druid and wizard
   sorcerer: [1, 1, 4, 6, 8, 10, 12, 14, 16, 18],
@@ -2857,12 +2859,15 @@ function coins(gp) {
     .filter(([n]) => n).map(([n, unit]) => `${n.toLocaleString("en-US")} ${unit}`).join(" ") || "0 gp";
 }
 
-function scrollPrice(level, spell, cls) {
-  const casterLevel = scrollCasterLevel(Number(level), cls);
+// At the minimum caster level, or at a chosen higher one (`chosen`, never below the minimum: the spell's level in the
+// book can change after the scroll was saved)
+function scrollPrice(level, spell, cls, chosen = null) {
+  const minimum = scrollCasterLevel(Number(level), cls);
+  const casterLevel = Math.max(minimum, Number(chosen) || minimum);
   const base = (Number(level) || 0.5) * casterLevel * 25;
   const costs = componentCosts(spell, cls);
   return {
-    casterLevel, base, costs,
+    casterLevel, minimum, base, costs,
     market: base + costs.gp + costs.xp * 5,
     scribeGp: base / 2 + costs.gp,
     scribeXp: Math.ceil(base / 25) + costs.xp,
@@ -2877,7 +2882,25 @@ function costNote(costs) {
   return costs.variable ? `${text ? `${text}; ` : ""}the component cost varies: check the spell` : text;
 }
 
-// Scrolls of a spell: of one class, or of every class (card badge)
+// What a scroll entry saves as its caster level: nothing at the minimum (like the scrolls saved before caster levels
+// could be chosen), the number above it
+function storedCasterLevel(casterLevel, minimum) {
+  return casterLevel > minimum ? casterLevel : null;
+}
+
+// The scroll entries of a spell in a class: [{casterLevel (stored, null = minimum), count}], minimum first
+function scrollLevels(id, cls) {
+  return (state.character?.scrolls || [])
+    .filter((s) => s.id === id && s.class === cls.key)
+    .map((s) => ({ casterLevel: s.caster_level || null, count: s.count }))
+    .sort((a, b) => (a.casterLevel || 0) - (b.casterLevel || 0));
+}
+
+function scrollsAt(id, cls, casterLevel) {
+  return scrollLevels(id, cls).find((s) => s.casterLevel === (casterLevel || null))?.count || 0;
+}
+
+// Scrolls of a spell (all caster levels): of one class, or of every class (card badge)
 const scrollCountCache = new WeakMap();
 
 function scrollCount(id, cls = null) {
@@ -2905,29 +2928,53 @@ function scrollTotals(classes = viewClasses()) {
     if (level === undefined || !cls) continue;
     const spell = characterSpell(scroll.id).spell;
     count += scroll.count;
-    value += scroll.count * scrollPrice(level, spell, cls).market;
+    value += scroll.count * scrollPrice(level, spell, cls, scroll.caster_level).market;
   }
   return { count, value };
 }
 
-// "Scroll" line on the spell sheet: one line per class of the spell
+// "Scroll" line on the spell sheet: one line per class of the spell, and the scrolls owned at each caster level
 function scrollSummary(entry) {
   const classes = entryClasses(entry);
   return classes.map((cls) => {
     const level = levelIn(cls, entry.spell.id) ?? entry.level;
     const price = scrollPrice(level, entry.spell, cls);
-    const owned = scrollCount(entry.spell.id, cls);
-    return `${classes.length > 1 ? `${esc(cls.name)}: ` : ""}caster level ${price.casterLevel} · ${esc(coins(price.market))}${price.costs.variable ? " or more" : ""}`
-      + `${owned ? `<br><b>${owned} owned, ${esc(coins(price.market * owned))}${price.costs.variable ? "+" : ""} in total</b>` : ""}`;
+    const plus = price.costs.variable ? "+" : "";
+    const owned = scrollLevels(entry.spell.id, cls).map((s) => {
+      const at = scrollPrice(level, entry.spell, cls, s.casterLevel);
+      return `<br><b>${s.count} owned at caster level ${at.casterLevel}, ${esc(coins(at.market * s.count))}${plus} in total</b>`;
+    }).join("");
+    return `${classes.length > 1 ? `${esc(cls.name)}: ` : ""}caster level ${price.casterLevel} · ${esc(coins(price.market))}${price.costs.variable ? " or more" : ""}${owned}`;
   }).join("<br>");
 }
 
-function scrollRow({ entry, count, price }, cls) {
+// The scrolls of a spell at a caster level above the minimum: their prices and their own stepper
+function scrollLevelLine(entry, cls, { casterLevel, count }) {
+  const inc = entry.spell;
+  const price = scrollPrice(entry.level, inc, cls, casterLevel);
+  const plus = price.costs.variable ? "+" : "";
+  return `
+    <div class="scroll-level">
+      <span class="scroll-level-name">Caster level ${price.casterLevel}</span>
+      <span class="scroll-level-prices"><b>${esc(coins(price.market))}${plus}</b> each · total for ${count}: <b>${esc(coins(price.market * count))}${plus}</b>
+        · scribe one: ${esc(coins(price.scribeGp))} + ${price.scribeXp.toLocaleString("en-US")} XP</span>
+      <div class="stepper">
+        <button type="button" data-scroll-change="-1" data-scroll="${esc(inc.id)}" data-cl="${price.casterLevel}" aria-label="One ${esc(cls.name)} scroll of ${esc(inc.name)} at caster level ${price.casterLevel} less">−</button>
+        <span class="copies" aria-live="polite">${count}</span>
+        <button type="button" data-scroll-change="1" data-scroll="${esc(inc.id)}" data-cl="${price.casterLevel}" aria-label="One more ${esc(cls.name)} scroll of ${esc(inc.name)} at caster level ${price.casterLevel}" ${count >= 99 ? "disabled" : ""}>+</button>
+      </div>
+    </div>`;
+}
+
+function scrollRow({ entry, count, price, levels }, cls) {
   const inc = entry.spell;
   const note = costNote(price.costs);
   const plus = price.costs.variable ? "+" : "";
+  const higher = levels.filter((s) => s.casterLevel && s.casterLevel > price.minimum);
+  const free = Array.from({ length: MAX_SCROLL_CASTER_LEVEL - price.minimum }, (_, i) => price.minimum + 1 + i)
+    .filter((n) => !higher.some((s) => s.casterLevel === n));
   return `
-    <li class="prep-row scroll-row ${count ? "active" : ""} ${entry.available === false || forbiddenSchool(inc, cls) ? "unavailable" : ""}" style="--c:${schoolColor(inc)}">
+    <li class="prep-row scroll-row ${count || higher.length ? "active" : ""} ${entry.available === false || forbiddenSchool(inc, cls) ? "unavailable" : ""}" style="--c:${schoolColor(inc)}">
       <button type="button" class="prep-name" data-open="${esc(inc.id)}">
         <span class="name">${esc(inc.name)}</span>
         <span class="subline">${esc(school(inc))} · caster level ${price.casterLevel}${forbiddenSchool(inc, cls) ? " · forbidden school: you can't use it" : ""}${entry.available === false ? " · spellbook not available" : ""}</span>
@@ -2938,6 +2985,10 @@ function scrollRow({ entry, count, price }, cls) {
         ${count ? `<span class="scroll-total">total for ${count}: <b>${esc(coins(price.market * count))}${plus}</b></span>` : ""}
         <span>scribe one: ${esc(coins(price.scribeGp))} + ${price.scribeXp.toLocaleString("en-US")} XP</span>
         ${note ? `<span class="cost-note">${esc(note)}</span>` : ""}
+        ${free.length ? `<select class="scroll-level-add" data-scroll-add="${esc(inc.id)}" aria-label="Add a ${esc(cls.name)} scroll of ${esc(inc.name)} at a higher caster level">
+            <option value="">+ caster level</option>
+            ${free.map((n) => `<option value="${n}">caster level ${n} — ${esc(coins(scrollPrice(entry.level, inc, cls, n).market))}${plus}</option>`).join("")}
+          </select>` : ""}
       </div>
       <div class="controls">
         ${favoriteButton(inc)}
@@ -2947,6 +2998,7 @@ function scrollRow({ entry, count, price }, cls) {
           <button type="button" data-scroll-change="1" data-scroll="${esc(inc.id)}" aria-label="One more ${esc(cls.name)} scroll of ${esc(inc.name)}" ${count >= 99 ? "disabled" : ""}>+</button>
         </div>
       </div>
+      ${higher.length ? `<div class="scroll-levels">${higher.map((s) => scrollLevelLine(entry, cls, s)).join("")}</div>` : ""}
     </li>`;
 }
 
@@ -2959,7 +3011,10 @@ function scrollSections(cls) {
     for (const entry of classEntries(cls)) {
       if (visible && !visible.has(entry.spell.id)) continue;
       if (!grouped.has(entry.level)) grouped.set(entry.level, []);
-      grouped.get(entry.level).push({ entry, count: scrollCount(entry.spell.id, cls), price: scrollPrice(entry.level, entry.spell, cls) });
+      grouped.get(entry.level).push({
+        entry, count: scrollsAt(entry.spell.id, cls, null), levels: scrollLevels(entry.spell.id, cls),
+        price: scrollPrice(entry.level, entry.spell, cls),
+      });
     }
     for (const group of grouped.values()) group.sort((a, b) => favoritesFirst(a.entry.spell, b.entry.spell));
     return grouped;
@@ -2970,9 +3025,9 @@ function scrollSections(cls) {
     const lazy = fromData(`scroll-rows:${cls.key}:${level}`, () => new Map(everyRow.map((row) => [row, lazyRow(row.entry.spell.id, () => scrollRow(row, cls))])));
     const allRows = fromData(`scroll-all:${cls.key}:${level}`, () => everyRow.map((row) => lazy.get(row)));
     const rows = filtering
-      ? everyRow.filter((row) => !(state.onlyOwned && !row.count) && matchesFilters(row.entry.spell, row.entry.books))
+      ? everyRow.filter((row) => !(state.onlyOwned && !row.levels.length) && matchesFilters(row.entry.spell, row.entry.books))
       : everyRow;
-    const owned = rows.reduce((total, row) => total + row.count, 0);
+    const owned = rows.reduce((total, row) => total + row.levels.reduce((sum, s) => sum + s.count, 0), 0);
     const casterLevel = scrollCasterLevel(level, cls);
     const title = levelTitle(level, cls);
     return {
@@ -2987,7 +3042,7 @@ function scrollSections(cls) {
           <span class="number">${level}</span>
           <div>
             <h2>${esc(title)}</h2>
-            <div class="level-info">caster level ${casterLevel} · ${esc(coins((level || 0.5) * casterLevel * 25))} a scroll, plus costly components</div>
+            <div class="level-info">caster level ${casterLevel} or higher · ${esc(coins((level || 0.5) * casterLevel * 25))} a scroll at ${casterLevel}, plus costly components</div>
           </div>
           <span class="counter ${owned ? "full" : ""}" title="Scrolls owned">${owned}</span>
         </div>`,
@@ -3009,9 +3064,10 @@ function renderScrolls() {
     container.dataset.layout = layout;
     container.innerHTML = `
       <div class="day" id="scroll-day"></div>
-      <p class="parchment-help scroll-help">Prices at the minimum caster level of each class: spell level × caster level × 25 gp
-        (a cantrip or orison counts as ½ level), plus costly material components and 5 gp for each XP the spell costs.
-        Scribing one yourself takes half the price in gold and 1/25 of it in XP, plus the full component costs.
+      <p class="parchment-help scroll-help">Market price: spell level × caster level × 25 gp (a cantrip or orison counts
+        as ½ level), plus costly material components and 5 gp for each XP the spell costs. Scribing one yourself takes
+        half the price in gold and 1/25 of it in XP, plus the full component costs. Each row starts at the minimum caster
+        level of the class; “+ caster level” adds stronger scrolls at a higher caster level, at a higher price.
         ${state.book.all ? "" : "The rows are the spells of this book; the totals include the scrolls of your other books of the same class."}</p>
       ${classJump(classes, "scrolls")}
       ${classes.map((cls) => `
@@ -3044,15 +3100,25 @@ function renderScrolls() {
   updateLevelTools();
 }
 
-function changeScrolls(cls, id, delta) {
+// Adds or takes away scrolls of a spell at a caster level (null or the minimum: the minimum)
+function changeScrolls(cls, id, delta, casterLevel = null) {
+  const level = levelIn(cls, id);
+  const stored = casterLevel && level !== undefined ? storedCasterLevel(Number(casterLevel), scrollCasterLevel(level, cls)) : null;
   const list = (state.character.scrolls || []).map((s) => ({ ...s }));
-  let scroll = list.find((s) => s.id === id && s.class === cls.key);
-  if (!scroll) list.push(scroll = { id, class: cls.key, count: 0 });
+  let scroll = list.find((s) => s.id === id && s.class === cls.key && (s.caster_level || null) === stored);
+  if (!scroll) list.push(scroll = { id, class: cls.key, count: 0, ...(stored ? { caster_level: stored } : {}) });
   scroll.count = Math.max(0, Math.min(99, scroll.count + delta));
   state.character.scrolls = list.filter((s) => s.count > 0);
   renderScrolls();
   savePreparation();
 }
+
+app.addEventListener("change", (event) => {
+  const select = event.target.closest("[data-scroll-add]");
+  if (state.view !== "scrolls" || !select?.value) return;
+  const cls = classByKey(select.closest("[data-class-block]")?.dataset.classBlock);
+  if (cls) changeScrolls(cls, select.dataset.scrollAdd, 1, Number(select.value));
+});
 
 app.addEventListener("click", (event) => {
   if (state.view !== "scrolls" || !event.target.closest("#scrolls")) return;
@@ -3060,7 +3126,7 @@ app.addEventListener("click", (event) => {
   if (!target) return;
   const cls = classByKey(target.closest("[data-class-block]")?.dataset.classBlock);
   if (target.id === "open-cart") return openCart();
-  if (target.dataset.scrollChange) return changeScrolls(cls, target.dataset.scroll, Number(target.dataset.scrollChange));
+  if (target.dataset.scrollChange) return changeScrolls(cls, target.dataset.scroll, Number(target.dataset.scrollChange), target.dataset.cl);
   if (target.dataset.open) return openSheet(target.dataset.open);
   if (target.dataset.jump) return jumpTo(target.dataset.jump);
   if (target.dataset.favorite) {
@@ -3072,7 +3138,18 @@ app.addEventListener("click", (event) => {
 // ---------- dialog: add scrolls ----------
 // A list of scrolls to add, with what they cost to buy (market price) and to scribe (gp + XP), checked against the
 // gold (and XP) the character can spend. "Add" puts them in the scroll counts. The list is kept while the page is open.
-const cart = { mode: "buy", budget: "", xp: "", counts: new Map(), text: "", level: "", cls: "", onlyChosen: false };
+const cart = { mode: "buy", budget: "", xp: "", counts: new Map(), casterLevels: new Map(), text: "", level: "", cls: "", onlyChosen: false };
+
+// The caster level chosen for a spell in the dialog (the minimum unless a higher one was picked) and its prices
+function cartPrice(item) {
+  const chosen = cart.casterLevels.get(item.key);
+  return chosen ? scrollPrice(item.entry.level, item.entry.spell, item.cls, chosen) : item.price;
+}
+
+// Scrolls of the spell already owned at the chosen caster level (each caster level can have up to 99)
+function cartOwned(item) {
+  return scrollsAt(item.entry.spell.id, item.cls, storedCasterLevel(cartPrice(item).casterLevel, item.price.minimum));
+}
 
 function cartKey(cls, id) {
   return `${cls.key}|${id}`;
@@ -3120,11 +3197,12 @@ function cartTotals(items) {
   for (const [key, n] of cart.counts) {
     const item = items.get(key);
     if (!item || !n) continue;
+    const price = cartPrice(item);
     totals.count += n;
-    totals.market += n * item.price.market;
-    totals.scribeGp += n * item.price.scribeGp;
-    totals.scribeXp += n * item.price.scribeXp;
-    totals.variable ||= item.price.costs.variable;
+    totals.market += n * price.market;
+    totals.scribeGp += n * price.scribeGp;
+    totals.scribeXp += n * price.scribeXp;
+    totals.variable ||= price.costs.variable;
     if (cartBlocked(item)) totals.blocked += n;
   }
   totals.gp = cart.mode === "buy" ? totals.market : totals.scribeGp;
@@ -3139,14 +3217,16 @@ function openCart() {
   // chosen spells that are no longer on the page are dropped
   const items = cartItems();
   for (const key of cart.counts.keys()) if (!items.has(key)) cart.counts.delete(key);
+  for (const key of cart.casterLevels.keys()) if (!items.has(key)) cart.casterLevels.delete(key);
   const classes = viewClasses();
   if (!classes.some((c) => c.key === cart.cls)) cart.cls = "";
   const levels = [...new Set([...items.values()].map((i) => i.entry.level))].sort((a, b) => a - b);
   if (!levels.includes(Number(cart.level))) cart.level = "";
   $("#cart").innerHTML = `
     <h2>Add scrolls</h2>
-    <p class="help">Choose how many scrolls of each spell you are adding: the costs add up at the bottom.
-      Write the gold you can spend to see what is left, and use “Max” to fill it with one spell.</p>
+    <p class="help">Choose how many scrolls of each spell you are adding, and their caster level (the minimum for the
+      class, or higher for a stronger scroll): the costs add up at the bottom. Write the gold you can spend to see what
+      is left, and use “Max” to fill it with one spell.</p>
     <div class="field-row">
       <label>Gold you can spend (gp)
         <input type="number" inputmode="decimal" min="0" step="any" id="cart-budget" placeholder="e.g. 500" value="${esc(cart.budget)}">
@@ -3214,10 +3294,12 @@ function renderCart() {
 
 function cartRow(i, totals, multi) {
   const n = cart.counts.get(i.key) || 0;
-  const p = i.price;
+  const p = cartPrice(i);
   const plus = p.costs.variable ? "+" : "";
   const blocked = cartBlocked(i);
-  const room = 99 - i.owned - n;  // a spell can have at most 99 scrolls
+  const ownedHere = cartOwned(i);
+  const room = 99 - ownedHere - n;  // at most 99 scrolls of a spell at one caster level
+  const casterLevels = Array.from({ length: MAX_SCROLL_CASTER_LEVEL - p.minimum + 1 }, (_, k) => p.minimum + k);
   const unit = cart.mode === "buy" ? p.market : p.scribeGp;
   const canMax = !blocked && room > 0 && totals.goldLeft !== null && unit > 0 && maxMore(i, totals) > 0;
   return `
@@ -3225,7 +3307,10 @@ function cartRow(i, totals, multi) {
       <div class="cart-info">
         <span class="cart-name"><button type="button" class="ref" data-cart-open="${esc(i.entry.spell.id)}">${esc(i.entry.spell.name)}</button>
           ${multi ? `<span class="finder-tag">${esc(i.cls.name)}</span>` : ""}${isFavorite(i.entry.spell.id) ? ` <span class="favorite-mark" title="Favorite">${icon("heart", "filled")}</span>` : ""}</span>
-        <span class="cart-meta">${esc(levelTitle(i.entry.level, i.cls))} · caster level ${p.casterLevel}${i.owned ? ` · you have ${i.owned}` : ""}</span>
+        <span class="cart-meta">${esc(levelTitle(i.entry.level, i.cls))} ·
+          <label class="cart-cl">caster level <select data-cart-cl="${esc(i.key)}" aria-label="Caster level of the ${esc(i.entry.spell.name)} scrolls">
+            ${casterLevels.map((cl) => `<option value="${cl}" ${cl === p.casterLevel ? "selected" : ""}>${cl}${cl === p.minimum ? " (minimum)" : ""}</option>`).join("")}
+          </select></label>${i.owned ? ` · you have ${i.owned}${i.owned !== ownedHere ? `, ${ownedHere} at this caster level` : ""}` : ""}</span>
         <span class="cart-prices"><span class="${cart.mode === "buy" ? "current" : ""}">buy ${esc(coins(p.market))}${plus}</span>
           <span class="${cart.mode === "scribe" ? "current" : ""}">scribe ${esc(coins(p.scribeGp))}${plus} + ${p.scribeXp.toLocaleString("en-US")} XP</span></span>
         ${forbiddenSchool(i.entry.spell, i.cls) ? `<span class="cart-note">${esc(forbiddenSchool(i.entry.spell, i.cls))} is a forbidden school: you can buy the scroll but not use or scribe it.</span>`
@@ -3245,10 +3330,11 @@ function cartRow(i, totals, multi) {
 
 // How many more scrolls of this spell the gold (and XP, when scribing) left can pay for
 function maxMore(item, totals) {
-  const unit = cart.mode === "buy" ? item.price.market : item.price.scribeGp;
+  const price = cartPrice(item);
+  const unit = cart.mode === "buy" ? price.market : price.scribeGp;
   let most = Math.floor((totals.goldLeft + 1e-9) / unit);
-  if (totals.xpLeft !== null && item.price.scribeXp) most = Math.min(most, Math.floor(totals.xpLeft / item.price.scribeXp));
-  return Math.max(0, Math.min(most, 99 - item.owned - (cart.counts.get(item.key) || 0)));
+  if (totals.xpLeft !== null && price.scribeXp) most = Math.min(most, Math.floor(totals.xpLeft / price.scribeXp));
+  return Math.max(0, Math.min(most, 99 - cartOwned(item) - (cart.counts.get(item.key) || 0)));
 }
 
 function renderCartSummary(totals) {
@@ -3288,8 +3374,9 @@ function addCartScrolls() {
   for (const [key, n] of cart.counts) {
     const item = items.get(key);
     if (!item || !n) continue;
-    let scroll = list.find((s) => s.id === item.entry.spell.id && s.class === item.cls.key);
-    if (!scroll) list.push(scroll = { id: item.entry.spell.id, class: item.cls.key, count: 0 });
+    const stored = storedCasterLevel(cartPrice(item).casterLevel, item.price.minimum);
+    let scroll = list.find((s) => s.id === item.entry.spell.id && s.class === item.cls.key && (s.caster_level || null) === stored);
+    if (!scroll) list.push(scroll = { id: item.entry.spell.id, class: item.cls.key, count: 0, ...(stored ? { caster_level: stored } : {}) });
     scroll.count = Math.min(99, scroll.count + n);
   }
   state.character.scrolls = list;
@@ -3300,6 +3387,7 @@ function addCartScrolls() {
   if (totals.goldLeft !== null) cart.budget = String(Math.max(0, Math.round(totals.goldLeft * 100) / 100));
   if (totals.xpLeft !== null) cart.xp = String(Math.max(0, totals.xpLeft));
   cart.counts.clear();
+  cart.casterLevels.clear();
   $("#cart-dialog").close();
   renderScrolls();
   savePreparation();
@@ -3320,6 +3408,13 @@ $("#cart").addEventListener("change", (event) => {
   if (target.name === "cart-mode") {
     cart.mode = target.value;
     $("#cart-xp-field").hidden = cart.mode !== "scribe";
+  } else if (target.dataset.cartCl) {
+    const item = cartItems().get(target.dataset.cartCl);
+    const chosen = Number(target.value);
+    if (item && chosen > item.price.minimum) cart.casterLevels.set(item.key, chosen);
+    else cart.casterLevels.delete(target.dataset.cartCl);
+    // the scrolls already chosen may not fit any more: at most 99 at a caster level
+    if (item) cart.counts.set(item.key, Math.min(cart.counts.get(item.key) || 0, 99 - cartOwned(item)));
   } else if (target.id === "cart-level") cart.level = target.value;
   else if (target.id === "cart-class") cart.cls = target.value;
   else if (target.id === "cart-only") cart.onlyChosen = target.checked;
@@ -3346,6 +3441,7 @@ $("#cart").addEventListener("click", (event) => {
     openSheet(d.cartOpen);
   } else if (target.id === "cart-clear") {
     cart.counts.clear();
+    cart.casterLevels.clear();
     renderCart();
   } else if (target.id === "cart-add") {
     addCartScrolls();
@@ -3755,6 +3851,14 @@ function formatDescription(html) {
     button.textContent = link.textContent;
     link.replaceWith(button);
   }
+  for (const link of root.querySelectorAll("a[data-spell]")) {  // a spell named in a creature's SRD text
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ref";
+    button.dataset.srdSpell = link.dataset.spell;
+    button.textContent = link.textContent;
+    link.replaceWith(button);
+  }
   for (const link of root.querySelectorAll("a")) link.replaceWith(...link.childNodes); // any other link
   for (const table of root.querySelectorAll("table")) {
     const container = document.createElement("div");
@@ -3789,6 +3893,7 @@ const fullSheetData = new Map();  // id -> sheet
 function forgetFullSheets() {
   fullSheets.clear();
   fullSheetData.clear();
+  creatureLists.clear();
 }
 
 function fullSheet(id) {
@@ -3805,6 +3910,96 @@ function fullSheet(id) {
 }
 
 let sheetRequest = null;
+
+// --- creatures a summoning spell lists: their SRD sheets, downloaded by the server the first time ---
+const creatureLists = new Map();  // spell id -> promise of GET /api/spells/<id>/creatures
+let creatureView = { data: null, items: [] };  // what the open sheet lists: a click on a name opens items[n]
+
+async function showCreatures(id) {
+  if (!creatureLists.has(id)) {
+    creatureLists.set(id, api(`spells/${encodeURIComponent(id)}/creatures`).catch((error) => ({ groups: [], error: error.message })));
+  }
+  const data = await creatureLists.get(id);
+  if (data.error) creatureLists.delete(id);  // asked again the next time the sheet opens
+  const box = $("#sheet-creatures");
+  if (box && $("#sheet").dataset.open === id) box.innerHTML = renderCreatures(data);
+}
+
+// The names only (with the picture as a thumbnail): a click opens the creature in its own dialog
+function renderCreatures(data) {
+  const { groups = [], creatures = {}, error } = data;
+  creatureView = { data, items: [] };
+  const lists = groups.map((group) => {
+    const headings = [...new Set(group.items.map((item) => item.heading || ""))];
+    return (groups.length > 1 ? `<h4 class="creature-source">${esc(group.name)}</h4>` : "") + headings.map((heading) => `
+      ${heading ? `<p class="creature-heading">${esc(heading)}</p>` : ""}
+      <div class="creature-list">${group.items.filter((item) => (item.heading || "") === heading).map((item) => {
+        const creature = creatures[item.creature];
+        if (!creature) return `<span class="creature-chip missing">${esc(item.text)}${item.creature === null ? " <small>not in the SRD</small>" : ""}</span>`;
+        creatureView.items.push({ item, group: group.name });
+        const picture = creature.pictures?.[0];
+        return `<button type="button" class="creature-chip" data-creature-item="${creatureView.items.length - 1}">
+          ${picture ? `<img src="/monster-images/${encodeURIComponent(picture.file)}" alt="" loading="lazy" onerror="this.remove()">` : ""}
+          <span><span class="creature-name">${esc(item.text)}</span><small>${esc(creatureKind(creature))}</small></span></button>`;
+      }).join("")}</div>`).join("");
+  }).join("");
+  return `<h3>Creatures</h3>${error ? `<p class="appears">${esc(error)} Open the spell again to try once more.</p>` : ""}${lists}`;
+}
+
+function creatureKind(creature) {
+  return creature.type ? `${creature.type}${creature.subtypes?.length ? ` (${creature.subtypes.join(", ")})` : ""}` : "";
+}
+
+// The Monster Manual art (its own, or the group pictures of its family) or a Wikipedia photo of a real animal
+function creaturePictures(creature, item) {
+  const pictures = creature.pictures || [];
+  if (!pictures.length) return "";
+  const name = item.text.replace(/\s*\(.*$/, "").toLowerCase();
+  return `<div class="creature-art">${pictures.map((picture) => {
+    const caption = picture.source === "wikipedia"
+      ? `Photo: ${esc(picture.caption)} (<a href="${esc(picture.url)}" target="_blank" rel="noopener">Wikipedia ↗</a>)`
+      : `${esc(picture.caption)}${picture.group ? ` — group picture from the Monster Manual: the ${esc(name)} may be in it` : ""}`
+        + `${picture.artist ? ` · art by ${esc(picture.artist)}` : ""} · Monster Manual v.3.5, p. ${esc(String(parseInt(picture.page, 10)))}`;
+    return `<figure><img src="/monster-images/${encodeURIComponent(picture.file)}" alt="${esc(picture.caption)}" loading="lazy"
+      onerror="this.closest('figure').hidden = true"><figcaption>${caption}</figcaption></figure>`;
+  }).join("")}</div>`;
+}
+
+function creaturePart(title, html) {
+  return `<details class="creature-part"><summary>${esc(title)}</summary><div class="description" lang="en">${formatDescription(html).html}</div></details>`;
+}
+
+// One listed creature, in its dialog above the spell: its SRD sheet, the templates in its name (Celestial,
+// Fiendish), what its page says about the whole family (the demons, the elementals) and the rules of its type
+// and subtypes
+function openCreature(index) {
+  const { item, group } = creatureView.items[index] || {};
+  const { creatures = {}, types = {} } = creatureView.data || {};
+  const creature = creatures[item?.creature];
+  if (!creature) return;
+  const templates = (item.templates || []).map((t) => creatures[t]).filter(Boolean);
+  const srdName = [creature.name, ...templates.map((t) => `${t.name} template`)].join(" + ");
+  $("#creature").innerHTML = `
+    <article class="parchment condition-sheet creature-sheet">
+      <button class="sheet-close" type="button" data-close aria-label="Close">×</button>
+      <p class="overline">${esc([group, item.heading].filter(Boolean).join(" · "))}</p>
+      <h2>${esc(item.text)}</h2>
+      <p class="creature-kind">${esc([creatureKind(creature), srdName.toLowerCase() === item.text.toLowerCase() ? "" : `SRD: ${srdName}`].filter(Boolean).join(" · "))}</p>
+      ${creaturePictures(creature, item)}
+      <div class="description" lang="en">${formatDescription(creature.html).html}</div>
+      ${templates.map((t) => creaturePart(`${t.name} template`, t.html)).join("")}
+      ${creature.intro_html ? creaturePart(`About ${creature.intro_name}`, creature.intro_html) : ""}
+      ${(creature.type_keys || []).filter((key) => types[key]).map((key) => creaturePart(types[key].name, types[key].html)).join("")}
+      <div class="sheet-actions">
+        <span class="spacer"></span>
+        <a class="button" href="${esc(creature.url)}" target="_blank" rel="noopener">d20srd.org ↗</a>
+        <button class="button gold" type="button" data-close>Close</button>
+      </div>
+    </article>`;
+  const dialog = $("#creature-dialog");
+  if (!dialog.open) dialog.showModal();
+  $("#creature .parchment").scrollTop = 0;
+}
 
 async function openSheet(id, options = {}) {
   const found = findSpell(id);
@@ -3911,6 +4106,8 @@ function showSheet(id, { from = null } = {}) {
               ${b.text ? `<div class="description" lang="en">${b.text.html}</div>`
                 : `<p class="appears">This spell was not downloaded: use “Refresh from dndtools”.</p>`}
             </section>`).join("")}
+          ${inc.has_creatures ? `<section class="creatures" id="sheet-creatures" aria-live="polite">
+              <h3>Creatures</h3><p class="appears">Looking up the creatures in the SRD…</p></section>` : ""}
           ${inc.also_appears_in?.length ? `<p class="appears">Also appears in: ${esc(inc.also_appears_in.join(", "))}</p>` : ""}
         </div>
       </div>
@@ -3948,13 +4145,15 @@ function showSheet(id, { from = null } = {}) {
         <span class="not-in-book">Not in ${all ? "your spellbooks" : "this book"}</span>
         <span class="spacer"></span>
         ${from ? `<button class="button" type="button" data-ref="${esc(from)}">← Back</button>` : ""}
+        ${inc.handwritten ? "" : `
         <a class="button" href="${esc(inc.url)}" target="_blank" rel="noopener">dndtools ↗</a>
-        ${$("#add-dialog").open || all || locked ? "" : `<button class="button gold" type="button" id="sheet-add">${icon("plus")}Add to this book</button>`}
+        ${$("#add-dialog").open || all || locked ? "" : `<button class="button gold" type="button" id="sheet-add">${icon("plus")}Add to this book</button>`}`}
       </div>`}
     </article>`;
 
   const dialog = $("#sheet-dialog");
   $("#sheet").dataset.open = inc.id;
+  if (inc.has_creatures) showCreatures(inc.id);
   if (!entry) {
     $("#sheet-add")?.addEventListener("click", () => {
       dialog.close();
@@ -5064,7 +5263,9 @@ function openHandwrittenDialog(inc = null) {
   form.querySelector('select[name="level"] option[value="0"]').textContent = levelZeroOption();
   $("#save-handwritten").textContent = inc ? "Save changes" : "Add to book";
   if (inc) {
-    for (const field of HANDWRITTEN_FIELDS) handwrittenField(field).value = inc[field] ?? inc.stats?.[field] ?? "";
+    // the stats and components borrowed from a "functions like" base stay with the base
+    const inherited = inc.inherited_from?.keys || {};
+    for (const field of HANDWRITTEN_FIELDS) handwrittenField(field).value = inherited[field] ? "" : inc[field] ?? inc.stats?.[field] ?? "";
     handwrittenField("subschools").value = (inc.subschools || []).join(", ");
     handwrittenField("descriptors").value = (inc.descriptors || []).join(", ");
     handwrittenField("levels").value = [
@@ -5072,7 +5273,7 @@ function openHandwrittenDialog(inc = null) {
       ...(inc.domains || []).map((d) => `${d.domain} domain ${d.level}`),
     ].join(", ");
     handwrittenField("description").value = inc.description_text || "";
-    for (const box of form.querySelectorAll('[name="components"]')) box.checked = (inc.components || []).includes(box.value);
+    for (const box of form.querySelectorAll('[name="components"]')) box.checked = !inherited.components && (inc.components || []).includes(box.value);
   }
   $("#handwritten-dialog").showModal();
   $("#handwritten-dialog").scrollTop = 0;
@@ -5416,7 +5617,12 @@ app.addEventListener("click", (event) => {
     return pickCard(picked, event.shiftKey);
   }
   const base = event.target.closest("[data-ref-card]");
-  if (base) return openSheet(base.dataset.refCard, { from: base.dataset.from });
+  if (base) {
+    // a base that isn't in the book comes with the full sheet of the spell based on it
+    const { refCard: id, from } = base.dataset;
+    return (findSpell(id) ? Promise.resolve() : fullSheet(from))
+      .then(() => openSheet(id, { from }), (error) => notify(error.message, true));
+  }
   const card = event.target.closest(".card");
   if (card) openSheet(card.dataset.id);
   // a click on a level header (or its ▾ button) folds or unfolds that level
@@ -5500,6 +5706,114 @@ $("#sheet").addEventListener("click", (event) => {
   }
   const current = $("#sheet").dataset.open;
   openSheet(ref.dataset.ref, { from: ref.textContent.startsWith("←") ? null : current });
+});
+
+$("#sheet").addEventListener("click", (event) => {
+  const chip = event.target.closest("[data-creature-item]");
+  if (chip) openCreature(Number(chip.dataset.creatureItem));
+});
+$("#creature").addEventListener("click", (event) => {
+  const condition = event.target.closest("[data-condition]");
+  if (condition) openCondition(condition.dataset.condition);
+  const spell = event.target.closest("[data-srd-spell]");
+  if (spell) openSpellByName(spell.dataset.srdSpell);
+});
+
+// ---------- dialog: a spell named in a creature's text ----------
+// "At will—detect evil, sleep": read only, above the creature. The server sends the saved sheet, or finds the spell
+// on dndtools and downloads it; the spells it references open in the same dialog ("← Back").
+const spellsByName = new Map();  // lowercase name -> promise of the completed sheet
+const spellRef = { request: null, stack: [] };
+
+function openSpellByName(name) {
+  const key = name.toLowerCase();
+  spellRef.request = key;
+  $("#spell-ref").innerHTML = `
+    <article class="parchment sheet">
+      <button class="sheet-close" type="button" data-close aria-label="Close">×</button>
+      <p class="loading" id="spell-ref-status">Looking up ${esc(name)}…</p>
+    </article>`;
+  const dialog = $("#spell-ref-dialog");
+  if (!dialog.open) dialog.showModal();
+  if (!spellsByName.has(key)) spellsByName.set(key, api("spell-by-name", { method: "POST", body: { name } }));
+  spellsByName.get(key).then((sheet) => {
+    if (spellRef.request !== key || !dialog.open) return;
+    spellRef.stack = [sheet];
+    renderSpellRef();
+  }, (error) => {
+    spellsByName.delete(key);  // asked again next time
+    if (spellRef.request === key && $("#spell-ref-status")) $("#spell-ref-status").textContent = error.message;
+  });
+}
+
+function renderSpellRef() {
+  const inc = spellRef.stack.at(-1);
+  const linked = spellRef.stack[0].linked || [];
+  const st = inc.stats || {};
+  const description = formatDescription(inc.description_html || `<p>${esc(inc.summary || "")}</p>`);
+  const bases = (inc.inherited_from?.chain || []).map(({ id, name }) => {
+    const base = linked.find((c) => c.id === id);
+    return { id, name, text: base ? formatDescription(base.description_html || `<p>${esc(base.summary || "")}</p>`) : null };
+  });
+  const baseNotes = inc.inherited_from?.keys?.components
+    ? bases.find((b) => b.name === inc.inherited_from.keys.components)?.text?.notes || [] : [];
+  const componentsHtml = [
+    (inc.components || []).map((c) => `<abbr title="${esc(COMPONENTS[c] || c)}">${esc(c)}</abbr>`).join(" ") + inheritedNote(inc, "components"),
+    ...[...description.notes, ...baseNotes].map((n) => `<div class="component-note"><b>${esc(n.label)}:</b> ${n.html}</div>`),
+  ].filter((part) => part.replace(/<small[^]*<\/small>/, "").trim()).join("");
+  const data = [
+    ...STATS.map(([key, label]) => [label, st[key] ? esc(st[key]) + inheritedNote(inc, key) : ""]),
+    ["Components", componentsHtml],
+  ].filter(([, value]) => value);
+  const levels = [
+    ...(inc.levels || []).map((l) => `${l.caster_class} ${l.level}`),
+    ...(inc.domains || []).map((d) => `${d.domain} domain ${d.level}`),
+  ].join(", ");
+  const known = Boolean(findSpell(inc.id)?.entry);
+  $("#spell-ref").innerHTML = `
+    <article class="parchment sheet" style="--c:${schoolColor(inc)}">
+      <button class="sheet-close" type="button" data-close aria-label="Close">×</button>
+      <h2>${esc(inc.name)}</h2>
+      <div class="school-line">${schoolLine(inc)}</div>
+      <div class="source">${esc(shortSource(inc))}${inc.edition_35 ? "" : " · not 3.5"}</div>
+      ${levels ? `<p class="class-levels"><b>Level:</b> ${esc(levels)}</p>` : ""}
+      <div class="sheet-body">
+        <aside class="sheet-side">
+          <dl class="stats-table">${data.map(([e, v]) => `<dt>${esc(e)}</dt><dd>${v}</dd>`).join("")}</dl>
+        </aside>
+        <div class="sheet-text">
+          <div class="description" lang="en">${description.html}</div>
+          ${bases.map((b) => `
+            <section class="base-spell">
+              <h3>Based on <button type="button" class="ref" data-ref="${esc(b.id)}">${esc(b.name)}</button></h3>
+              ${b.text ? `<div class="description" lang="en">${b.text.html}</div>` : ""}
+            </section>`).join("")}
+        </div>
+      </div>
+      <div class="sheet-actions">
+        <span class="not-in-book">${known ? "In your spellbooks" : `Not in ${state.book?.all ? "your spellbooks" : "this book"}`}</span>
+        <span class="spacer"></span>
+        ${spellRef.stack.length > 1 ? `<button class="button" type="button" data-spell-back>← Back</button>` : ""}
+        ${inc.url ? `<a class="button" href="${esc(inc.url)}" target="_blank" rel="noopener">dndtools ↗</a>` : ""}
+        <button class="button gold" type="button" data-close>Close</button>
+      </div>
+    </article>`;
+  $("#spell-ref .parchment").scrollTop = 0;
+}
+
+$("#spell-ref").addEventListener("click", (event) => {
+  const condition = event.target.closest("[data-condition]");
+  if (condition) return openCondition(condition.dataset.condition);
+  if (event.target.closest("[data-spell-back]")) {
+    spellRef.stack.pop();
+    return renderSpellRef();
+  }
+  const ref = event.target.closest("[data-ref]");
+  if (!ref) return;
+  const sheet = (spellRef.stack[0].linked || []).find((c) => c.id === ref.dataset.ref);
+  if (!sheet) return notify("This spell was not downloaded: open it on dndtools.", true);
+  spellRef.stack.push(sheet);
+  renderSpellRef();
 });
 
 $("#condition").addEventListener("click", (event) => {

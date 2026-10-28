@@ -61,8 +61,9 @@ NUMBER = (r"(?:\d/\d{1,2}(?!\d)|(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?(?:[ -]\d/\d
 SEPARATOR = r"\s*(?:-|–|\bto\b|\bor\b|\band\b|\bby\b|x|×)\s*"  # "5 to 10 feet", "5-by-5 feet"
 SPACE = r"(?:\s|&nbsp;|-)?"
 
+# a number right after "/" is part of a fraction, except after an abbreviation: "Space/Reach: 5 ft./5 ft."
 UNIT_RE = re.compile(
-    rf"(?<![\w.,/])(?P<numbers>{NUMBER}(?:{SEPARATOR}{NUMBER})*)(?P<space>{SPACE})"
+    rf"(?:(?<=\./)|(?<![\w.,/]))(?P<numbers>{NUMBER}(?:{SEPARATOR}{NUMBER})*)(?P<space>{SPACE})"
     rf"(?P<unit>{'|'.join(f'(?P<{name}>{pattern})' for name, pattern in UNITS)})(?![A-Za-z])", re.I)
 NUMBER_RE = re.compile(NUMBER)
 # "between –50 and 140 degrees Fahrenheit", "32° F"
