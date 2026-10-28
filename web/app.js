@@ -2786,7 +2786,8 @@ app.addEventListener("change", (event) => {
 // The caster level is at least the lowest that can cast the spell in the scriber's class, and can be higher (up to
 // MAX_SCROLL_CASTER_LEVEL: a stronger scroll, at a higher price); costly material components are added at their value
 // and XP costs at 5 gp per XP (a focus isn't used up, so it isn't added). Scribing a scroll yourself costs half the
-// base price in gp and 1/25 of it in XP, plus the full component costs.
+// base price in gp and 1/25 of it in XP, plus the full component costs, and takes one day (8 hours of work) per
+// 1,000 gp of the base price, at least one day per scroll (the component costs don't count for the time).
 const MAX_SCROLL_CASTER_LEVEL = 20;
 const SCROLL_CASTER_LEVELS = {
   wizard: [1, 1, 3, 5, 7, 9, 11, 13, 15, 17],  // cleric, druid and wizard
@@ -2871,7 +2872,13 @@ function scrollPrice(level, spell, cls, chosen = null) {
     market: base + costs.gp + costs.xp * 5,
     scribeGp: base / 2 + costs.gp,
     scribeXp: Math.ceil(base / 25) + costs.xp,
+    scribeDays: Math.max(1, Math.ceil(base / 1000)),
   };
+}
+
+// 1 -> "1 day", 12 -> "12 days"
+function days(n) {
+  return `${n.toLocaleString("en-US")} day${n === 1 ? "" : "s"}`;
 }
 
 function costNote(costs) {
@@ -2957,7 +2964,7 @@ function scrollLevelLine(entry, cls, { casterLevel, count }) {
     <div class="scroll-level">
       <span class="scroll-level-name">Caster level ${price.casterLevel}</span>
       <span class="scroll-level-prices"><b>${esc(coins(price.market))}${plus}</b> each · total for ${count}: <b>${esc(coins(price.market * count))}${plus}</b>
-        · scribe one: ${esc(coins(price.scribeGp))} + ${price.scribeXp.toLocaleString("en-US")} XP</span>
+        · scribe one: ${esc(coins(price.scribeGp))} + ${price.scribeXp.toLocaleString("en-US")} XP, ${days(price.scribeDays)}</span>
       <div class="stepper">
         <button type="button" data-scroll-change="-1" data-scroll="${esc(inc.id)}" data-cl="${price.casterLevel}" aria-label="One ${esc(cls.name)} scroll of ${esc(inc.name)} at caster level ${price.casterLevel} less">−</button>
         <span class="copies" aria-live="polite">${count}</span>
@@ -2983,7 +2990,7 @@ function scrollRow({ entry, count, price, levels }, cls) {
       <div class="scroll-price">
         <span><b>${esc(coins(price.market))}${plus}</b> each</span>
         ${count ? `<span class="scroll-total">total for ${count}: <b>${esc(coins(price.market * count))}${plus}</b></span>` : ""}
-        <span>scribe one: ${esc(coins(price.scribeGp))} + ${price.scribeXp.toLocaleString("en-US")} XP</span>
+        <span>scribe one: ${esc(coins(price.scribeGp))} + ${price.scribeXp.toLocaleString("en-US")} XP, ${days(price.scribeDays)}</span>
         ${note ? `<span class="cost-note">${esc(note)}</span>` : ""}
         ${free.length ? `<select class="scroll-level-add" data-scroll-add="${esc(inc.id)}" aria-label="Add a ${esc(cls.name)} scroll of ${esc(inc.name)} at a higher caster level">
             <option value="">+ caster level</option>
@@ -3193,7 +3200,7 @@ function cartBlocked(item) {
 }
 
 function cartTotals(items) {
-  const totals = { count: 0, market: 0, scribeGp: 0, scribeXp: 0, variable: false, blocked: 0 };
+  const totals = { count: 0, market: 0, scribeGp: 0, scribeXp: 0, scribeDays: 0, variable: false, blocked: 0 };
   for (const [key, n] of cart.counts) {
     const item = items.get(key);
     if (!item || !n) continue;
@@ -3202,6 +3209,7 @@ function cartTotals(items) {
     totals.market += n * price.market;
     totals.scribeGp += n * price.scribeGp;
     totals.scribeXp += n * price.scribeXp;
+    totals.scribeDays += n * price.scribeDays;
     totals.variable ||= price.costs.variable;
     if (cartBlocked(item)) totals.blocked += n;
   }
@@ -3312,12 +3320,12 @@ function cartRow(i, totals, multi) {
             ${casterLevels.map((cl) => `<option value="${cl}" ${cl === p.casterLevel ? "selected" : ""}>${cl}${cl === p.minimum ? " (minimum)" : ""}</option>`).join("")}
           </select></label>${i.owned ? ` · you have ${i.owned}${i.owned !== ownedHere ? `, ${ownedHere} at this caster level` : ""}` : ""}</span>
         <span class="cart-prices"><span class="${cart.mode === "buy" ? "current" : ""}">buy ${esc(coins(p.market))}${plus}</span>
-          <span class="${cart.mode === "scribe" ? "current" : ""}">scribe ${esc(coins(p.scribeGp))}${plus} + ${p.scribeXp.toLocaleString("en-US")} XP</span></span>
+          <span class="${cart.mode === "scribe" ? "current" : ""}">scribe ${esc(coins(p.scribeGp))}${plus} + ${p.scribeXp.toLocaleString("en-US")} XP, ${days(p.scribeDays)}</span></span>
         ${forbiddenSchool(i.entry.spell, i.cls) ? `<span class="cart-note">${esc(forbiddenSchool(i.entry.spell, i.cls))} is a forbidden school: you can buy the scroll but not use or scribe it.</span>`
           : blocked ? `<span class="cart-note">Its spellbook is not available: it can be bought, not scribed.</span>` : ""}
       </div>
       <div class="cart-controls">
-        ${n ? `<span class="cart-line">${n} × = <b>${esc(coins(n * unit))}${plus}</b>${cart.mode === "scribe" ? ` + ${(n * p.scribeXp).toLocaleString("en-US")} XP` : ""}</span>` : ""}
+        ${n ? `<span class="cart-line">${n} × = <b>${esc(coins(n * unit))}${plus}</b>${cart.mode === "scribe" ? ` + ${(n * p.scribeXp).toLocaleString("en-US")} XP, ${days(n * p.scribeDays)}` : ""}</span>` : ""}
         ${canMax ? `<button type="button" class="button compact" data-cart-max="${esc(i.key)}" title="As many as the gold left allows">Max</button>` : ""}
         <div class="stepper">
           <button type="button" data-cart-change="-1" data-key="${esc(i.key)}" aria-label="One scroll of ${esc(i.entry.spell.name)} less" ${n ? "" : "disabled"}>−</button>
@@ -3337,6 +3345,12 @@ function maxMore(item, totals) {
   return Math.max(0, Math.min(most, 99 - cartOwned(item) - (cart.counts.get(item.key) || 0)));
 }
 
+// ", about 3 weeks" for a long scribing time
+function inWeeks(n) {
+  if (n < 14) return "";
+  return n < 60 ? `, about ${Math.round(n / 7)} weeks` : `, about ${Math.round(n / 30)} months`;
+}
+
 function renderCartSummary(totals) {
   const plus = totals.variable ? "+" : "";
   const buying = cart.mode === "buy";
@@ -3351,13 +3365,17 @@ function renderCartSummary(totals) {
       ? `<p class="cart-left">XP left: <b>${totals.xpLeft.toLocaleString("en-US")}</b> (of ${amount(cart.xp).toLocaleString("en-US")})</p>`
       : `<p class="cart-left over">Not enough XP: <b>${(-totals.xpLeft).toLocaleString("en-US")}</b> short</p>`);
   }
+  if (!buying && totals.count) {
+    lines.push(`<p class="cart-vary">${days(totals.scribeDays)} of 8 hours${inWeeks(totals.scribeDays)}: one day per
+      1,000 gp of a scroll's base price, at least one per scroll.</p>`);
+  }
   if (totals.blocked) lines.push(`<p class="cart-left over">${totals.blocked} of them can't be scribed: their school is forbidden or their spellbook is not available.</p>`);
   if (totals.variable) lines.push(`<p class="cart-vary">Some component costs vary with the casting: the totals are the least they cost.</p>`);
   $("#cart-summary").innerHTML = `
     <div class="cart-totals">
       <span class="cart-count"><b>${totals.count}</b> scroll${totals.count === 1 ? "" : "s"}</span>
       <span class="${buying ? "current" : ""}">Buy: <b>${esc(coins(totals.market))}${plus}</b></span>
-      <span class="${buying ? "" : "current"}">Scribe: <b>${esc(coins(totals.scribeGp))}${plus}</b> + <b>${totals.scribeXp.toLocaleString("en-US")} XP</b></span>
+      <span class="${buying ? "" : "current"}">Scribe: <b>${esc(coins(totals.scribeGp))}${plus}</b> + <b>${totals.scribeXp.toLocaleString("en-US")} XP</b> in <b>${days(totals.scribeDays)}</b></span>
     </div>
     ${lines.join("")}`;
   const add = $("#cart-add");
@@ -3381,7 +3399,8 @@ function addCartScrolls() {
   }
   state.character.scrolls = list;
   const plus = totals.variable ? "+" : "";
-  const cost = cart.mode === "buy" ? `${coins(totals.market)}${plus}` : `${coins(totals.scribeGp)}${plus} and ${totals.scribeXp.toLocaleString("en-US")} XP`;
+  const cost = cart.mode === "buy" ? `${coins(totals.market)}${plus}`
+    : `${coins(totals.scribeGp)}${plus} and ${totals.scribeXp.toLocaleString("en-US")} XP, in ${days(totals.scribeDays)} of work`;
   const left = totals.goldLeft !== null && totals.goldLeft >= 0 ? ` ${coins(totals.goldLeft)} left.` : "";
   // what is left becomes the gold (and XP) to spend next time
   if (totals.goldLeft !== null) cart.budget = String(Math.max(0, Math.round(totals.goldLeft * 100) / 100));

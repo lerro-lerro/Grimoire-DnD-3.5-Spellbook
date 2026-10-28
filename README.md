@@ -16,8 +16,8 @@ converted to metric, and keeps it on your computer.
 - **Prepare spells:** Grimoire counts your spells per day, including ability bonuses, specialist schools, domains,
   forbidden schools and metamagic feats. Tap **Cast** when you use a spell and **New day** after a rest. Sorcerers and
   other spontaneous casters spend slots instead.
-- **Scrolls:** the market price and the scribing cost (gold and XP) of each spell. **Add scrolls** plans a batch that
-  fits your gold.
+- **Scrolls:** the market price and the scribing cost (gold, XP and days of work) of each spell. **Add scrolls** plans a batch that
+  fits your gold, and says how long scribing it takes.
 - **Find spells fast:** search by name (words in any order), school, level, or any field of the spell: description,
   range, duration, components and more. Filters stay fast even with thousands of spells.
 - **Stay tidy:** favorites, folding levels, **Select** to remove many spells at once (with Undo), a list of removed
